@@ -3,6 +3,8 @@ Main application window for the Parquet Schema Transformer.
 """
 from __future__ import annotations
 
+import os
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
@@ -15,7 +17,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
-    QSizePolicy,
+    QSpinBox,
     QStatusBar,
     QTextEdit,
     QVBoxLayout,
@@ -24,6 +26,9 @@ from PyQt6.QtWidgets import (
 
 from gui.schema_table import SchemaTable
 from gui.workers import SchemaLoaderWorker, TransformWorker
+
+MAX_WORKERS = 32
+DEFAULT_MAX_ATTEMPTS = 5
 
 
 class MainWindow(QMainWindow):
@@ -35,6 +40,7 @@ class MainWindow(QMainWindow):
         self._schema_worker: SchemaLoaderWorker | None = None
         self._transform_worker: TransformWorker | None = None
         self._file_count: int = 0
+        self._max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -135,10 +141,19 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        worker_label = QLabel("Workers:")
+        worker_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        worker_label.setFixedWidth(70)
+
+        self._worker_spin = QSpinBox()
+        self._worker_spin.setRange(1, MAX_WORKERS)
+        self._worker_spin.setValue(self._default_worker_count())
+        self._worker_spin.setToolTip("Number of parallel worker threads")
+
         self._dryrun_btn = QPushButton("Dry Run")
         self._dryrun_btn.setFixedWidth(100)
         self._dryrun_btn.setToolTip(
-            "Simulate the transformation — no files will be uploaded"
+            "Simulate the transformation - no files will be uploaded"
         )
         self._dryrun_btn.clicked.connect(lambda: self._on_apply(dry_run=True))
 
@@ -151,6 +166,9 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._on_cancel)
 
+        layout.addWidget(worker_label)
+        layout.addWidget(self._worker_spin)
+        layout.addSpacing(12)
         layout.addWidget(self._dryrun_btn)
         layout.addStretch()
         layout.addWidget(self._apply_btn)
@@ -192,7 +210,7 @@ class MainWindow(QMainWindow):
         self._load_btn.setEnabled(False)
         self._dryrun_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
-        self._status_label.setText("Loading schema…")
+        self._status_label.setText("Loading schema...")
 
     def _set_schema_loaded_state(self) -> None:
         self._load_btn.setEnabled(True)
@@ -228,7 +246,7 @@ class MainWindow(QMainWindow):
 
         self._schema_table.clear_schema()
         self._set_loading_state()
-        self._log_info(f"Connecting to container '{container}', prefix '{prefix}'…")
+        self._log_info(f"Connecting to container '{container}', prefix '{prefix}'...")
 
         self._schema_worker = SchemaLoaderWorker(conn, container, prefix)
         self._schema_worker.schema_loaded.connect(self._on_schema_loaded)
@@ -252,12 +270,12 @@ class MainWindow(QMainWindow):
         self._apply_btn.setEnabled(False)
         self._load_btn.setEnabled(True)
         self._log_error(f"Failed to load schema:\n{msg}")
-        self._status_label.setText("Error — see log")
+        self._status_label.setText("Error - see log")
 
     def _on_apply(self, dry_run: bool) -> None:
         col_configs = self._schema_table.get_column_configs()
         if not col_configs:
-            self._log_info("No transforms selected — nothing to do.")
+            self._log_info("No transforms selected - nothing to do.")
             return
 
         conn = self._conn_str_edit.text().strip()
@@ -268,10 +286,14 @@ class MainWindow(QMainWindow):
         if self._newprefix_radio.isChecked():
             output_prefix = self._output_prefix_edit.text().strip() or None
 
+        worker_count = self._worker_spin.value()
+
         label = "[DRY RUN] " if dry_run else ""
         self._log_info(
-            f"{label}Starting — {self._file_count} file(s), "
-            f"{len(col_configs)} transform(s)…"
+            f"{label}Starting - {self._file_count} file(s), "
+            f"{len(col_configs)} transform(s), "
+            f"{worker_count} worker(s), "
+            f"{self._max_attempts} attempt(s)/file..."
         )
 
         self._set_processing_state()
@@ -284,6 +306,8 @@ class MainWindow(QMainWindow):
             col_configs=col_configs,
             output_prefix=output_prefix,
             dry_run=dry_run,
+            worker_count=worker_count,
+            max_attempts=self._max_attempts,
         )
         self._transform_worker.progress.connect(self._on_transform_progress)
         self._transform_worker.file_error.connect(self._on_file_error)
@@ -294,24 +318,46 @@ class MainWindow(QMainWindow):
     def _on_cancel(self) -> None:
         if self._transform_worker and self._transform_worker.isRunning():
             self._cancel_btn.setEnabled(False)
-            self._log_info("Cancelling after current file…")
+            self._log_info("Cancelling after current file...")
             self._transform_worker.cancel()
 
-    def _on_transform_progress(self, current: int, total: int, blob_name: str) -> None:
-        self._progress.setValue(current)
-        self._status_label.setText(f"{current} / {total} files")
-        short = blob_name.split("/")[-1]
-        self._log_info(f"  Processing ({current}/{total}): {short}")
+    def _on_transform_progress(
+        self,
+        completed: int,
+        total: int,
+        blob_name: str,
+        duration_ms: float,
+        worker_id: int,
+    ) -> None:
+        self._progress.setValue(completed)
+        self._status_label.setText(f"{completed} / {total} files")
+        width = len(str(total))
+        current_str = str(completed).zfill(width)
+        total_str = str(total).zfill(width)
+        seconds = duration_ms / 1000.0
+        self._log_info(
+            f"Worker #{worker_id} | {current_str}/{total_str} | {blob_name} | {seconds:.2f} s"
+        )
 
     def _on_file_error(self, blob_name: str, tb: str) -> None:
         self._log_error(f"  FAILED: {blob_name}\n{tb.strip()}")
 
-    def _on_transform_finished(self, processed: int, failed: int) -> None:
+    def _on_transform_finished(
+        self,
+        processed: int,
+        failed: int,
+        total_seconds: float,
+        avg_seconds: float,
+    ) -> None:
         self._set_schema_loaded_state()
-        msg = f"Done. {processed} succeeded"
+        msg = (
+            f"Done in {total_seconds:.2f} s (avg {avg_seconds:.2f} s/file). "
+            f"{processed} succeeded"
+        )
         if failed:
-            msg += f", {failed} failed"
-        msg += "."
+            msg += f", {failed} failed."
+        else:
+            msg += "."
         self._log_info(msg)
         self._status_label.setText(msg)
 
@@ -340,3 +386,7 @@ class MainWindow(QMainWindow):
         cursor.insertText(text + "\n")
         self._log.setTextCursor(cursor)
         self._log.ensureCursorVisible()
+
+    def _default_worker_count(self) -> int:
+        cores = os.cpu_count() or 4
+        return max(1, min(MAX_WORKERS, cores))

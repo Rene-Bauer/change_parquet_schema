@@ -93,26 +93,6 @@ def binary16_to_uuid(array: pa.Array, params: dict) -> pa.Array:
 
 
 @register(
-    "timestamp_ns_to_ms",
-    "→ timestamp[ms] (Spark)",
-    applicable_types=["timestamp[ns]"],
-)
-def timestamp_ns_to_ms(array: pa.Array, params: dict) -> pa.Array:
-    """
-    Cast timestamp[ns] to timestamp[ms], preserving the original timezone.
-
-    If the source column has no timezone (tz=None), the output also has none.
-    PyArrow then writes TIMESTAMP(isAdjustedToUTC=False, unit=MILLIS) to Parquet,
-    which Spark / Databricks Autoloader reads as a local (non-UTC) timestamp.
-
-    Nanosecond and microsecond precision is truncated (not rounded) to milliseconds.
-    """
-    tz = array.type.tz  # None if no timezone was set — do not force UTC
-    target = pa.timestamp("ms", tz=tz)
-    return array.cast(target, safe=False)  # safe=False: truncate sub-ms precision, don't raise
-
-
-@register(
     "timestamp_ns_to_ms_utc",
     "→ timestamp[ms, UTC] (Spark)",
     applicable_types=["timestamp[ns]"],
