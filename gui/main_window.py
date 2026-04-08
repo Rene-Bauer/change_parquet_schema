@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import csv
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import perf_counter
 
 from PyQt6.QtCore import Qt
@@ -45,12 +45,17 @@ _COLOR_WARN    = QColor("#aa8800")   # amber  – warnings (unknown size etc.)
 
 
 def _format_duration(seconds: float) -> str:
-    """Format seconds as 'Xm Ys' when >= 60 s, otherwise 'X.XXs'."""
+    """Format seconds as 'Xh Ym Zs' / 'Xm Ys' / 'X.XXs'."""
     if seconds < 60:
         return f"{seconds:.2f}s"
-    minutes = int(seconds // 60)
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    return f"{minutes}m {secs}s"
+    return f"{hours}h {minutes}m {secs}s"
 
 
 class MainWindow(QMainWindow):
@@ -672,7 +677,12 @@ class MainWindow(QMainWindow):
             if remaining > 0:
                 s_per_file = elapsed / self._files_completed_in_run
                 eta_s = s_per_file * remaining
-                parts.append(f"ETA {_format_duration(eta_s)}")
+                finish_time = datetime.now() + timedelta(seconds=int(eta_s))
+                if finish_time.date() == datetime.now().date():
+                    finish_str = finish_time.strftime("%H:%M")
+                else:
+                    finish_str = finish_time.strftime("%d.%m. %H:%M")
+                parts.append(f"ETA {_format_duration(eta_s)} (fertig ~{finish_str})")
         self._throughput_label.setText("  " + "  ·  ".join(parts) if parts else "")
 
         self._status_label.setText(f"{completed} / {total} files")
