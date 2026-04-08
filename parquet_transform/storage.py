@@ -8,11 +8,39 @@ access and cannot be streamed sequentially.
 from __future__ import annotations
 
 import io
-from typing import Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from azure.storage.blob import BlobServiceClient, ContainerClient
+
+
+def _extract_blob_size(blob) -> int:
+    """
+    Extract the byte size from an Azure BlobProperties / BlobItem object.
+
+    Different azure-storage-blob versions and storage configurations (ADLS Gen2,
+    page blobs, append blobs …) expose the size under different attribute paths.
+    We try the most common ones in order and return -1 when none yields a
+    positive integer — the caller treats -1 as "size unknown".
+    """
+    candidates = (
+        # Standard attribute on BlobProperties (azure-storage-blob 12.x)
+        lambda b: b.size,
+        # Nested path used by some SDK versions / BlobItem wrappers
+        lambda b: b.properties.size,
+        lambda b: b.properties.content_length,
+    )
+    for getter in candidates:
+        try:
+            raw = getter(blob)
+            if raw is None:
+                continue
+            value = int(raw)
+            if value >= 0:
+                return value
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return -1  # sentinel: size unknown
 
 
 class BlobStorageClient:
@@ -34,15 +62,43 @@ class BlobStorageClient:
         blobs = self._container.list_blobs(name_starts_with=prefix)
         return [b.name for b in blobs if b.name.endswith(".parquet")]
 
+    def list_blobs_with_sizes(self, prefix: str) -> list[tuple[str, int]]:
+        """
+        Return (blob_name, size_bytes) for all .parquet blobs under *prefix*.
+        Size information is included in the same API response at no extra cost.
+
+        Uses -1 as a sentinel when the size cannot be determined (see
+        _extract_blob_size for the full fallback chain).  Callers must treat
+        -1 as "size unknown" and exclude those blobs from any total-size sum.
+        """
+        blobs = self._container.list_blobs(name_starts_with=prefix)
+        return [
+            (b.name, _extract_blob_size(b))
+            for b in blobs
+            if b.name.endswith(".parquet")
+        ]
+
     # ------------------------------------------------------------------
     # Download
     # ------------------------------------------------------------------
 
-    def download_bytes(self, blob_name: str, timeout: int = 60) -> bytes:
+    def download_bytes(self, blob_name: str, timeout: int = 120) -> bytes:
         """Download a blob to memory and return its raw bytes."""
         blob_client = self._container.get_blob_client(blob_name)
         downloader = blob_client.download_blob(timeout=timeout)
-        return downloader.readall()
+        try:
+            return downloader.readall()
+        except Exception:
+            # Silence the SDK's "Incomplete download." print() in __del__:
+            # the StorageStreamDownloader prints to stdout when garbage-collected
+            # with _download_complete=False. We mark it done here so the message
+            # doesn't appear for expected network errors (which are already
+            # logged and retried by our own error handling).
+            try:
+                downloader._download_complete = True
+            except Exception:
+                pass
+            raise
 
     def read_schema(self, blob_name: str) -> pa.Schema:
         """
@@ -62,8 +118,19 @@ class BlobStorageClient:
         blob_name: str,
         data: bytes,
         overwrite: bool = True,
-        timeout: int = 60,
+        timeout: int = 300,
     ) -> None:
         """Upload raw bytes to a blob, overwriting by default."""
         blob_client = self._container.get_blob_client(blob_name)
         blob_client.upload_blob(data, overwrite=overwrite, timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Close the underlying Azure SDK connection pool."""
+        try:
+            self._container.close()
+        except Exception:
+            pass

@@ -1,20 +1,20 @@
 """
-Core processing logic: download → transform → upload.
+Core processing logic: apply column transforms to a PyArrow Table.
 
-This module is UI-agnostic. Progress and log callbacks are injected so
-the same code can be driven by the GUI workers or a plain script.
+This module is UI-agnostic and can be driven by the GUI workers or a plain
+script.  The ``process_blob`` function that previously combined download /
+transform / upload has been removed — that logic now lives in
+``gui/workers.py`` so that progress callbacks, cancellation, and retry are
+handled uniformly at the worker level.
 """
 from __future__ import annotations
 
-import io
 from dataclasses import dataclass, field
 from typing import Callable
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from parquet_transform import transforms as tr
-from parquet_transform.storage import BlobStorageClient
 
 
 @dataclass
@@ -48,41 +48,6 @@ def apply_transforms(
     return table
 
 
-def process_blob(
-    client: BlobStorageClient,
-    blob_name: str,
-    col_configs: list[ColumnConfig],
-    output_blob_name: str,
-    dry_run: bool = False,
-    log_fn: Callable[[str], None] | None = None,
-) -> None:
-    """
-    Download one Parquet blob, transform it, and upload the result.
-
-    Args:
-        client: Connected BlobStorageClient.
-        blob_name: Source blob path inside the container.
-        col_configs: Transformations to apply.
-        output_blob_name: Destination blob path (may equal blob_name for in-place).
-        dry_run: If True, transform but do not upload.
-        log_fn: Optional callback for progress messages.
-    """
-    raw = client.download_bytes(blob_name)
-    buf = io.BytesIO(raw)
-    table = pq.read_table(buf)
-
-    table = apply_transforms(table, col_configs, log_fn=log_fn)
-
-    if dry_run:
-        if log_fn:
-            log_fn(f"  [DRY RUN] would upload to: {output_blob_name}")
-        return
-
-    out_buf = io.BytesIO()
-    pq.write_table(table, out_buf)
-    client.upload_bytes(output_blob_name, out_buf.getvalue(), overwrite=True)
-
-
 def compute_output_name(
     blob_name: str,
     input_prefix: str,
@@ -94,8 +59,17 @@ def compute_output_name(
     If *output_prefix* is None, returns *blob_name* unchanged (in-place).
     Otherwise, replaces the leading *input_prefix* with *output_prefix*,
     preserving the relative path beneath the prefix.
+
+    Raises:
+        ValueError: if *output_prefix* is set but *blob_name* does not start
+            with *input_prefix* (prevents silently writing to wrong paths).
     """
     if output_prefix is None:
         return blob_name
+    if input_prefix and not blob_name.startswith(input_prefix):
+        raise ValueError(
+            f"Blob '{blob_name}' does not start with input prefix "
+            f"'{input_prefix}'. Cannot compute output path."
+        )
     relative = blob_name[len(input_prefix):]
     return output_prefix.rstrip("/") + "/" + relative.lstrip("/")
