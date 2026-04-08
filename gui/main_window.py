@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         # Feature 14: log storage for filtering and export
         self._log_entries: list[tuple[str, QColor | None]] = []
         self._log_filter: str = ""
+        self._log_flush_count: int = 0  # number of times log was flushed to file
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -327,6 +328,8 @@ class MainWindow(QMainWindow):
         self._log.setReadOnly(True)
         self._log.setFont(QFont("Consolas", 9))
         self._log.setMinimumHeight(140)
+        # Safety net: Qt-level hard cap so the widget never grows unbounded
+        self._log.document().setMaximumBlockCount(MAX_LOG_ENTRIES + 100)
         layout.addWidget(self._log)
         return box
 
@@ -847,19 +850,12 @@ class MainWindow(QMainWindow):
     def _append_log(self, text: str, color: QColor | None) -> None:
         self._log_entries.append((text, color))
 
-        # Improvement 5: cap log entries in memory
-        if len(self._log_entries) > MAX_LOG_ENTRIES:
-            drop_count = len(self._log_entries) - MAX_LOG_ENTRIES
-            self._log_entries = self._log_entries[-MAX_LOG_ENTRIES:]
-            notice = (
-                f"[... {drop_count} older log line(s) dropped (limit: {MAX_LOG_ENTRIES}) ...]",
-                _COLOR_WARN,
-            )
-            self._log_entries.insert(0, notice)
-            self._rebuild_log_view()
+        # Overflow guard: flush to file and clear widget — never rebuild
+        if len(self._log_entries) >= MAX_LOG_ENTRIES:
+            self._flush_log_to_file()
             return
 
-        # Fast path: just append if the entry passes the current filter
+        # Append-only fast path
         if self._entry_matches_filter(text):
             self._write_to_widget(text, color)
 
@@ -868,12 +864,41 @@ class MainWindow(QMainWindow):
             return True
         return self._log_filter.lower() in text.lower()
 
-    def _rebuild_log_view(self) -> None:
-        """Repopulate the log widget from _log_entries with the current filter applied."""
+    def _flush_log_to_file(self) -> None:
+        """Write all in-memory log entries to a timestamped file, then clear."""
+        self._log_flush_count += 1
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"parquet_transformer_log_{timestamp}_{self._log_flush_count}.txt"
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for entry_text, _ in self._log_entries:
+                    f.write(entry_text + "\n")
+        except Exception:
+            pass  # best-effort; don't block the GUI for a flush failure
+        self._log_entries.clear()
         self._log.clear()
-        for text, color in self._log_entries:
-            if self._entry_matches_filter(text):
-                self._write_to_widget(text, color)
+        self._write_to_widget(
+            f"[Log flushed to {path} ({MAX_LOG_ENTRIES} entries) — continuing]",
+            _COLOR_WARN,
+        )
+
+    def _rebuild_log_view(self) -> None:
+        """Repopulate the log widget from _log_entries with the current filter.
+
+        Protected with setUpdatesEnabled to avoid per-line repaints.
+        Only called from filter changes — never during processing overflow.
+        """
+        self._log.setUpdatesEnabled(False)
+        try:
+            self._log.clear()
+            for text, color in self._log_entries:
+                if self._entry_matches_filter(text):
+                    self._write_to_widget(text, color)
+        finally:
+            self._log.setUpdatesEnabled(True)
 
     def _write_to_widget(self, text: str, color: QColor | None) -> None:
         cursor = self._log.textCursor()
