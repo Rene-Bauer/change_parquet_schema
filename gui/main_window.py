@@ -528,19 +528,21 @@ class MainWindow(QMainWindow):
 
     def _resolve_checkpoint(
         self, container: str, prefix: str, output_prefix: str | None
-    ) -> tuple[RunCheckpoint, FailedList, bool]:
+    ) -> tuple[RunCheckpoint, FailedList, bool] | None:
         """
         Check for an existing checkpoint, show dialogs as needed, and return
-        (checkpoint, failed_list, retry_failed).
+        (checkpoint, failed_list, retry_failed), or None if the user cancelled
+        on a complete checkpoint (caller should skip this prefix).
 
         Dialog logic:
-        - complete checkpoint    → ask Start Fresh (or cancel — returns with is_complete() True)
+        - complete checkpoint    → ask Start Fresh (or cancel — returns None)
         - in_progress checkpoint → ask Resume / Start Fresh
         - failed entries present on resume → ask Retry Failed Files
         """
         cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
         fl = FailedList.load_or_create(container, prefix)
         retry_failed = False
+        resuming = False
 
         if cp.is_complete():
             msg = QMessageBox(self)
@@ -553,11 +555,12 @@ class MainWindow(QMainWindow):
             msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
             msg.exec()
             if msg.clickedButton() != fresh_btn:
-                return cp, fl, False  # caller checks cp.is_complete() to abort
+                return None  # user cancelled — caller should skip this prefix
             cp.reset()
             fl.clear()
 
         elif cp.cursor is not None:
+            resuming = True
             # in_progress with a cursor — previous run was interrupted
             msg = QMessageBox(self)
             msg.setWindowTitle("Resume Previous Run")
@@ -570,11 +573,12 @@ class MainWindow(QMainWindow):
             fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.DestructiveRole)
             msg.exec()
             if msg.clickedButton() == fresh_btn:
+                resuming = False
                 cp.reset()
                 fl.clear()
 
-        # Failed-list dialog: shown only when resuming (cursor still set after above)
-        if fl.entries and cp.cursor is not None:
+        # Failed-list dialog: shown only when resuming
+        if resuming and fl.entries:
             total_failed = len(fl.entries)
             msg = QMessageBox(self)
             msg.setWindowTitle("Previously Failed Files")
@@ -592,46 +596,41 @@ class MainWindow(QMainWindow):
 
     def _start_next_prefix(self) -> None:
         """Advance to the next prefix in the queue and start processing."""
-        if self._current_prefix_index >= len(self._pending_prefixes):
-            self._log_info("All prefixes in batch completed.")
-            self._set_schema_loaded_state()
-            return
+        while self._current_prefix_index < len(self._pending_prefixes):
+            prefix = self._pending_prefixes[self._current_prefix_index]
+            self._active_prefix = prefix
+            self._blob_sizes = {}  # fresh sizes for each new prefix
 
-        prefix = self._pending_prefixes[self._current_prefix_index]
-        self._active_prefix = prefix
-        self._blob_sizes = {}  # fresh sizes for each new prefix
+            batch_count = len(self._pending_prefixes)
+            if batch_count > 1:
+                self._log_info(
+                    f"[{self._current_prefix_index + 1}/{batch_count}] "
+                    f"Processing prefix: '{prefix}'"
+                )
 
-        batch_count = len(self._pending_prefixes)
-        if batch_count > 1:
-            self._log_info(
-                f"[{self._current_prefix_index + 1}/{batch_count}] "
-                f"Processing prefix: '{prefix}'"
+            container = self._container_edit.text().strip()
+            output_prefix: str | None = None
+            if self._newprefix_radio.isChecked():
+                output_prefix = self._output_prefix_edit.text().strip() or None
+
+            result = self._resolve_checkpoint(container, prefix, output_prefix)
+            if result is None:
+                self._log_info(f"[Checkpoint] Skipping prefix '{prefix}' — previous run was complete.")
+                self._current_prefix_index += 1
+                continue
+            checkpoint, failed_list, retry_failed = result
+
+            self._start_transform(
+                blob_names=None,
+                prefix_override=prefix,
+                checkpoint=checkpoint,
+                failed_list=failed_list,
+                retry_failed=retry_failed,
             )
-
-        conn = self._conn_str_edit.text().strip()
-        container = self._container_edit.text().strip()
-        output_prefix: str | None = None
-        if self._newprefix_radio.isChecked():
-            output_prefix = self._output_prefix_edit.text().strip() or None
-
-        checkpoint, failed_list, retry_failed = self._resolve_checkpoint(
-            container, prefix, output_prefix
-        )
-
-        # If user cancelled the "complete" dialog, skip this prefix
-        if checkpoint.is_complete():
-            self._log_info(f"[Checkpoint] Skipping prefix '{prefix}' — previous run was complete.")
-            self._current_prefix_index += 1
-            self._start_next_prefix()
             return
 
-        self._start_transform(
-            blob_names=None,
-            prefix_override=prefix,
-            checkpoint=checkpoint,
-            failed_list=failed_list,
-            retry_failed=retry_failed,
-        )
+        self._log_info("All prefixes in batch completed.")
+        self._set_schema_loaded_state()
 
     def _start_transform(
         self,
@@ -842,6 +841,8 @@ class MainWindow(QMainWindow):
                 f"Auto-retry #{self._retry_depth} queued for "
                 f"{failed_network} network failure(s)..."
             )
+            # Auto-retry: explicit blob list, no checkpoint — progress within this
+            # retry batch is not checkpointed. See design doc for rationale.
             self._start_transform(
                 blob_names=list(retriable_failed_names),
                 blob_sizes=self._blob_sizes or None,
