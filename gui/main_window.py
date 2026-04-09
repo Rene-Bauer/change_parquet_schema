@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
 
 from gui.schema_table import SchemaTable
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
+from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
 MAX_WORKERS = 32
 DEFAULT_MAX_ATTEMPTS = 5
@@ -527,31 +529,124 @@ class MainWindow(QMainWindow):
     # Multi-prefix batch orchestration
     # ------------------------------------------------------------------
 
+    def _resolve_checkpoint(
+        self, container: str, prefix: str, output_prefix: str | None
+    ) -> tuple[RunCheckpoint, FailedList, bool] | None:
+        """
+        Check for an existing checkpoint, show dialogs as needed, and return
+        (checkpoint, failed_list, retry_failed), or None if the user cancelled
+        on a complete checkpoint (caller should skip this prefix).
+
+        Dialog logic:
+        - complete checkpoint    → ask Start Fresh (or cancel — returns None)
+        - in_progress checkpoint → ask Resume / Start Fresh
+        - failed entries present on resume → ask Retry Failed Files
+        """
+        try:
+            cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
+            fl = FailedList.load_or_create(container, prefix)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Corrupt Checkpoint", str(exc))
+            return None
+        retry_failed = False
+        resuming = False
+
+        if cp.is_complete():
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Previous Run Complete")
+            msg.setText(
+                f"The previous run for prefix '{prefix}' completed successfully.\n\n"
+                "Start a fresh run?"
+            )
+            fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() != fresh_btn:
+                return None  # user cancelled — caller should skip this prefix
+            cp.reset()
+            fl.clear()
+
+        elif cp.cursor is not None:
+            resuming = True
+            # in_progress with a cursor — previous run was interrupted
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Resume Previous Run")
+            msg.setText(
+                f"A previous run for prefix '{prefix}' was interrupted.\n"
+                f"Last processed: {cp.cursor}\n\n"
+                "Resume from where it left off, or start fresh?"
+            )
+            resume_btn = msg.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
+            fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.DestructiveRole)
+            msg.exec()
+            if msg.clickedButton() == fresh_btn:
+                resuming = False
+                cp.reset()
+                fl.clear()
+
+        # Failed-list dialog: shown only when resuming
+        if resuming and fl.entries:
+            total_failed = len(fl.entries)
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Previously Failed Files")
+            msg.setText(
+                f"{total_failed} file(s) failed in a previous run "
+                f"({fl.corrupt_count} corrupt, {fl.network_count} network).\n\n"
+                "Retry them in this run?"
+            )
+            retry_btn = msg.addButton("Retry Failed Files", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            retry_failed = (msg.clickedButton() == retry_btn)
+
+        return cp, fl, retry_failed
+
     def _start_next_prefix(self) -> None:
         """Advance to the next prefix in the queue and start processing."""
-        if self._current_prefix_index >= len(self._pending_prefixes):
-            self._log_info("All prefixes in batch completed.")
-            self._set_schema_loaded_state()
+        while self._current_prefix_index < len(self._pending_prefixes):
+            prefix = self._pending_prefixes[self._current_prefix_index]
+            self._active_prefix = prefix
+            self._blob_sizes = {}  # fresh sizes for each new prefix
+
+            batch_count = len(self._pending_prefixes)
+            if batch_count > 1:
+                self._log_info(
+                    f"[{self._current_prefix_index + 1}/{batch_count}] "
+                    f"Processing prefix: '{prefix}'"
+                )
+
+            container = self._container_edit.text().strip()
+            output_prefix: str | None = None
+            if self._newprefix_radio.isChecked():
+                output_prefix = self._output_prefix_edit.text().strip() or None
+
+            result = self._resolve_checkpoint(container, prefix, output_prefix)
+            if result is None:
+                self._log_info(f"[Checkpoint] Skipping prefix '{prefix}' — previous run was complete.")
+                self._current_prefix_index += 1
+                continue
+            checkpoint, failed_list, retry_failed = result
+
+            self._start_transform(
+                blob_names=None,
+                prefix_override=prefix,
+                checkpoint=checkpoint,
+                failed_list=failed_list,
+                retry_failed=retry_failed,
+            )
             return
 
-        prefix = self._pending_prefixes[self._current_prefix_index]
-        self._active_prefix = prefix
-        self._blob_sizes = {}  # fresh sizes for each new prefix
-
-        batch_count = len(self._pending_prefixes)
-        if batch_count > 1:
-            self._log_info(
-                f"[{self._current_prefix_index + 1}/{batch_count}] "
-                f"Processing prefix: '{prefix}'"
-            )
-
-        self._start_transform(blob_names=None, prefix_override=prefix)
+        self._log_info("All prefixes in batch completed.")
+        self._set_schema_loaded_state()
 
     def _start_transform(
         self,
         blob_names: list[str] | None = None,
         blob_sizes: dict[str, int] | None = None,
         prefix_override: str | None = None,
+        checkpoint: RunCheckpoint | None = None,
+        failed_list: FailedList | None = None,
+        retry_failed: bool = False,
     ) -> None:
         """Create and start a TransformWorker."""
         # Improvement 8: always read connection fields at call time (not cached)
@@ -598,6 +693,9 @@ class MainWindow(QMainWindow):
             blob_names=blob_names,
             blob_sizes=blob_sizes,
             autoscale=autoscale,
+            checkpoint=checkpoint,
+            failed_list=failed_list,
+            retry_failed=retry_failed,
         )
         self._transform_worker.listing_complete.connect(self._on_listing_complete)
         self._transform_worker.progress.connect(self._on_transform_progress)
@@ -610,6 +708,7 @@ class MainWindow(QMainWindow):
         self._transform_worker.paused_signal.connect(self._on_worker_paused)
         self._transform_worker.resumed_signal.connect(self._on_worker_resumed)
         self._transform_worker.workers_calibrated.connect(self._on_workers_calibrated)
+        self._transform_worker.log_message.connect(self._log_info)
         self._transform_worker.start()
 
     # ------------------------------------------------------------------
@@ -750,6 +849,8 @@ class MainWindow(QMainWindow):
                 f"Auto-retry #{self._retry_depth} queued for "
                 f"{failed_network} network failure(s)..."
             )
+            # Auto-retry: explicit blob list, no checkpoint — progress within this
+            # retry batch is not checkpointed. See design doc for rationale.
             self._start_transform(
                 blob_names=list(retriable_failed_names),
                 blob_sizes=self._blob_sizes or None,
