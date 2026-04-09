@@ -1,0 +1,225 @@
+"""
+Local checkpoint and failed-file tracking for transform runs.
+
+Two independent, thread-safe classes:
+- RunCheckpoint  — cursor-based resume (one file per container+prefix)
+- FailedList     — persistent failed-file log (separate file, same key)
+
+Both write atomically via temp-file + os.replace to survive crashes.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# Resolved relative to this file so it always points to repo root/checkpoints/
+_CHECKPOINTS_DIR: Path = Path(__file__).parent.parent / "checkpoints"
+
+
+def _sanitize_key(container: str, prefix: str) -> str:
+    """Build a filesystem-safe key: container__prefix (special chars → _)."""
+    c = re.sub(r"[^a-zA-Z0-9]", "_", container)
+    p = re.sub(r"[^a-zA-Z0-9]", "_", prefix)
+    return f"{c}__{p}"
+
+
+def _atomic_write(path: Path, data: dict) -> None:
+    """Write *data* as JSON to *path* atomically via a sibling .tmp file."""
+    _CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# RunCheckpoint
+# ---------------------------------------------------------------------------
+
+class RunCheckpoint:
+    """
+    Cursor-based checkpoint for a single transform run.
+
+    The cursor is the blob name of the last successfully processed file.
+    On resume, all blobs that sort at or before the cursor are skipped.
+    Blob names from Azure are alphabetically sorted, which matches the
+    chronological folder structure (2026/03/01/10/...).
+    """
+
+    def __init__(self, path: Path, data: dict) -> None:
+        self._path = path
+        self._data = data
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def checkpoint_path(container: str, prefix: str) -> Path:
+        """Return the .json path for this container+prefix key."""
+        return _CHECKPOINTS_DIR / f"{_sanitize_key(container, prefix)}__checkpoint.json"
+
+    @staticmethod
+    def load_or_create(
+        container: str,
+        prefix: str,
+        output_prefix: str | None,
+    ) -> "RunCheckpoint":
+        """Load an existing checkpoint or create a fresh in_progress one."""
+        path = RunCheckpoint.checkpoint_path(container, prefix)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            now = _now()
+            data = {
+                "container": container,
+                "prefix": prefix,
+                "output_prefix": output_prefix,
+                "status": "in_progress",
+                "created_at": now,
+                "updated_at": now,
+                "cursor": None,
+            }
+        return RunCheckpoint(path, data)
+
+    def is_complete(self) -> bool:
+        """True when the run finished without cancellation."""
+        return self._data.get("status") == "complete"
+
+    def should_skip(self, blob_name: str, all_blobs: list[str]) -> bool:
+        """True if *blob_name* is at or before the cursor in the sorted listing."""
+        cursor = self._data.get("cursor")
+        if cursor is None:
+            return False
+        return blob_name <= cursor
+
+    @property
+    def cursor(self) -> str | None:
+        return self._data.get("cursor")
+
+    def advance_cursor(self, blob_name: str) -> None:
+        """Move cursor forward if *blob_name* sorts later than the current cursor."""
+        with self._lock:
+            current = self._data.get("cursor")
+            if current is None or blob_name > current:
+                self._data["cursor"] = blob_name
+                self._data["updated_at"] = _now()
+                _atomic_write(self._path, self._data)
+
+    def mark_complete(self) -> None:
+        """Mark the run as fully complete."""
+        with self._lock:
+            self._data["status"] = "complete"
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
+
+    def reset(self) -> None:
+        """Clear cursor and status — use before a fresh-start run."""
+        with self._lock:
+            self._data["status"] = "in_progress"
+            self._data["cursor"] = None
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
+
+
+# ---------------------------------------------------------------------------
+# FailedList
+# ---------------------------------------------------------------------------
+
+class FailedList:
+    """
+    Persistent log of files that failed (corrupt or network) across runs.
+
+    Entries are deduplicated by blob name — re-running a failed file that
+    succeeds removes the entry via remove(); renewed failures update it.
+    Never auto-reset — the user controls clearing via clear() or GUI action.
+    """
+
+    def __init__(self, path: Path, data: dict) -> None:
+        self._path = path
+        self._data = data
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def failed_list_path(container: str, prefix: str) -> Path:
+        """Return the .json path for this container+prefix key."""
+        return _CHECKPOINTS_DIR / f"{_sanitize_key(container, prefix)}__failed.json"
+
+    @staticmethod
+    def load_or_create(container: str, prefix: str) -> "FailedList":
+        """Load an existing failed list or create an empty one."""
+        path = FailedList.failed_list_path(container, prefix)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            now = _now()
+            data = {
+                "container": container,
+                "prefix": prefix,
+                "created_at": now,
+                "updated_at": now,
+                "entries": [],
+            }
+        return FailedList(path, data)
+
+    @property
+    def entries(self) -> list[dict]:
+        """Snapshot of all failed entries."""
+        return list(self._data["entries"])
+
+    @property
+    def corrupt_count(self) -> int:
+        return sum(1 for e in self._data["entries"] if e.get("type") == "corrupt")
+
+    @property
+    def network_count(self) -> int:
+        return sum(1 for e in self._data["entries"] if e.get("type") == "network")
+
+    def blob_names(self) -> list[str]:
+        """All failed blob names — use to re-add to a blob list for retry."""
+        return [e["name"] for e in self._data["entries"]]
+
+    def add_or_update(self, blob_name: str, type: str, reason: str) -> None:
+        """Record a failure. Updates an existing entry if the blob already failed."""
+        with self._lock:
+            entries = self._data["entries"]
+            for entry in entries:
+                if entry["name"] == blob_name:
+                    entry["type"] = type
+                    entry["reason"] = reason
+                    entry["failed_at"] = _now()
+                    break
+            else:
+                entries.append({
+                    "name": blob_name,
+                    "type": type,
+                    "reason": reason,
+                    "failed_at": _now(),
+                })
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
+
+    def remove(self, blob_name: str) -> None:
+        """Remove entry for *blob_name* (e.g. after a successful retry)."""
+        with self._lock:
+            before = len(self._data["entries"])
+            self._data["entries"] = [
+                e for e in self._data["entries"] if e["name"] != blob_name
+            ]
+            if len(self._data["entries"]) != before:
+                self._data["updated_at"] = _now()
+                _atomic_write(self._path, self._data)
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        with self._lock:
+            self._data["entries"] = []
+            self._data["updated_at"] = _now()
+            _atomic_write(self._path, self._data)
