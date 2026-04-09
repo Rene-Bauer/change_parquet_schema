@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from parquet_transform.checkpoint import FailedList, RunCheckpoint
 from parquet_transform.processor import ColumnConfig, apply_transforms, compute_output_name
 from parquet_transform.storage import BlobStorageClient
 
@@ -201,6 +202,9 @@ class TransformWorker(QThread):
         blob_names: list[str] | None = None,
         blob_sizes: dict[str, int] | None = None,
         autoscale: bool = False,
+        checkpoint: RunCheckpoint | None = None,
+        failed_list: FailedList | None = None,
+        retry_failed: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -215,6 +219,9 @@ class TransformWorker(QThread):
         self._blob_names = blob_names
         self._blob_sizes = blob_sizes
         self._autoscale = autoscale
+        self._checkpoint = checkpoint
+        self._failed_list = failed_list
+        self._retry_failed = retry_failed
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -254,6 +261,34 @@ class TransformWorker(QThread):
                 self.file_error.emit("(connection)", traceback.format_exc())
                 self.finished.emit(0, 1, 0, 0.0, 0.0, [])
                 return
+
+        # Checkpoint: skip already-processed blobs on resume
+        if self._checkpoint and blob_names:
+            before = len(blob_names)
+            blob_names = [b for b in blob_names if not self._checkpoint.should_skip(b)]
+            skipped = before - len(blob_names)
+            if skipped > 0:
+                self.file_error.emit(
+                    "(checkpoint)",
+                    f"[Checkpoint] Resuming — skipping {skipped} already-processed file(s)"
+                )
+
+        # Failed list: prepend previously failed blobs for retry (deduplicated)
+        if self._retry_failed and self._failed_list:
+            failed_names = self._failed_list.blob_names()
+            existing = set(blob_names)
+            extra = [n for n in failed_names if n not in existing]
+            blob_names = extra + blob_names
+            if extra:
+                for name in extra:
+                    entry_type = next(
+                        (e["type"] for e in self._failed_list.entries if e["name"] == name),
+                        "unknown",
+                    )
+                    self.file_error.emit(
+                        "(checkpoint)",
+                        f"[Failed List] Retrying previously failed file: {name} ({entry_type})"
+                    )
 
         total = len(blob_names)
         if total == 0:
@@ -304,6 +339,10 @@ class TransformWorker(QThread):
                 completed += 1
                 completed_so_far = completed
                 total_duration_ms += duration_ms
+                if self._checkpoint:
+                    self._checkpoint.advance_cursor(blob_name)
+                if self._failed_list:
+                    self._failed_list.remove(blob_name)
             self.progress.emit(completed_so_far, total, blob_name,
                                duration_ms, worker_id, skipped, note, size_bytes)
 
@@ -319,6 +358,13 @@ class TransformWorker(QThread):
                 completed += 1
                 completed_so_far = completed
                 total_duration_ms += duration_ms
+                if self._failed_list:
+                    ftype = "network" if retriable else "corrupt"
+                    self._failed_list.add_or_update(blob_name, ftype, short_error)
+                    self.file_error.emit(
+                        "(checkpoint)",
+                        f"[Failed List] Recorded {ftype} failure: {blob_name}"
+                    )
             if retriable:
                 self._log_final_failure(blob_name, attempts, short_error, error, suppress_trace)
             self.progress.emit(completed_so_far, total, blob_name,
@@ -499,6 +545,10 @@ class TransformWorker(QThread):
         if self._cancel_event.is_set():
             self.cancelled.emit()
             return
+
+        if self._checkpoint and not self._cancel_event.is_set():
+            self._checkpoint.mark_complete()
+            self.file_error.emit("(checkpoint)", "[Checkpoint] Run marked as complete")
 
         total_seconds = perf_counter() - start_time
         avg_seconds = (total_duration_ms / max(completed, 1)) / 1000.0 if completed else 0.0
