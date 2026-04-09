@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
 
 from gui.schema_table import SchemaTable
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
+from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
 MAX_WORKERS = 32
 DEFAULT_MAX_ATTEMPTS = 5
@@ -524,6 +526,70 @@ class MainWindow(QMainWindow):
     # Multi-prefix batch orchestration
     # ------------------------------------------------------------------
 
+    def _resolve_checkpoint(
+        self, container: str, prefix: str, output_prefix: str | None
+    ) -> tuple[RunCheckpoint, FailedList, bool]:
+        """
+        Check for an existing checkpoint, show dialogs as needed, and return
+        (checkpoint, failed_list, retry_failed).
+
+        Dialog logic:
+        - complete checkpoint    → ask Start Fresh (or cancel — returns with is_complete() True)
+        - in_progress checkpoint → ask Resume / Start Fresh
+        - failed entries present on resume → ask Retry Failed Files
+        """
+        cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
+        fl = FailedList.load_or_create(container, prefix)
+        retry_failed = False
+
+        if cp.is_complete():
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Previous Run Complete")
+            msg.setText(
+                f"The previous run for prefix '{prefix}' completed successfully.\n\n"
+                "Start a fresh run?"
+            )
+            fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() != fresh_btn:
+                return cp, fl, False  # caller checks cp.is_complete() to abort
+            cp.reset()
+            fl.clear()
+
+        elif cp.cursor is not None:
+            # in_progress with a cursor — previous run was interrupted
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Resume Previous Run")
+            msg.setText(
+                f"A previous run for prefix '{prefix}' was interrupted.\n"
+                f"Last processed: {cp.cursor}\n\n"
+                "Resume from where it left off, or start fresh?"
+            )
+            resume_btn = msg.addButton("Resume", QMessageBox.ButtonRole.AcceptRole)
+            fresh_btn = msg.addButton("Start Fresh", QMessageBox.ButtonRole.DestructiveRole)
+            msg.exec()
+            if msg.clickedButton() == fresh_btn:
+                cp.reset()
+                fl.clear()
+
+        # Failed-list dialog: shown only when resuming (cursor still set after above)
+        if fl.entries and cp.cursor is not None:
+            total_failed = len(fl.entries)
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Previously Failed Files")
+            msg.setText(
+                f"{total_failed} file(s) failed in a previous run "
+                f"({fl.corrupt_count} corrupt, {fl.network_count} network).\n\n"
+                "Retry them in this run?"
+            )
+            retry_btn = msg.addButton("Retry Failed Files", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            retry_failed = (msg.clickedButton() == retry_btn)
+
+        return cp, fl, retry_failed
+
     def _start_next_prefix(self) -> None:
         """Advance to the next prefix in the queue and start processing."""
         if self._current_prefix_index >= len(self._pending_prefixes):
@@ -542,13 +608,39 @@ class MainWindow(QMainWindow):
                 f"Processing prefix: '{prefix}'"
             )
 
-        self._start_transform(blob_names=None, prefix_override=prefix)
+        conn = self._conn_str_edit.text().strip()
+        container = self._container_edit.text().strip()
+        output_prefix: str | None = None
+        if self._newprefix_radio.isChecked():
+            output_prefix = self._output_prefix_edit.text().strip() or None
+
+        checkpoint, failed_list, retry_failed = self._resolve_checkpoint(
+            container, prefix, output_prefix
+        )
+
+        # If user cancelled the "complete" dialog, skip this prefix
+        if checkpoint.is_complete():
+            self._log_info(f"[Checkpoint] Skipping prefix '{prefix}' — previous run was complete.")
+            self._current_prefix_index += 1
+            self._start_next_prefix()
+            return
+
+        self._start_transform(
+            blob_names=None,
+            prefix_override=prefix,
+            checkpoint=checkpoint,
+            failed_list=failed_list,
+            retry_failed=retry_failed,
+        )
 
     def _start_transform(
         self,
         blob_names: list[str] | None = None,
         blob_sizes: dict[str, int] | None = None,
         prefix_override: str | None = None,
+        checkpoint: RunCheckpoint | None = None,
+        failed_list: FailedList | None = None,
+        retry_failed: bool = False,
     ) -> None:
         """Create and start a TransformWorker."""
         # Improvement 8: always read connection fields at call time (not cached)
@@ -595,6 +687,9 @@ class MainWindow(QMainWindow):
             blob_names=blob_names,
             blob_sizes=blob_sizes,
             autoscale=autoscale,
+            checkpoint=checkpoint,
+            failed_list=failed_list,
+            retry_failed=retry_failed,
         )
         self._transform_worker.listing_complete.connect(self._on_listing_complete)
         self._transform_worker.progress.connect(self._on_transform_progress)
