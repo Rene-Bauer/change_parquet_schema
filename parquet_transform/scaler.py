@@ -90,4 +90,29 @@ class AdaptiveScaler:
                     f"error rate {error_rate:.0%}, throughput drop {actual_drop:.0%}"
                 )
 
-        return current_workers, ""  # scale-up added in Task 3
+        # --- Scale-UP ---
+        per_conn_bw = total_bytes / total_seconds  # bytes/s per connection slot
+        total_bw = per_conn_bw * current_workers
+        headroom = int(total_bw * self._upload_timeout_s / p95_bytes * 0.7) - current_workers
+        measured_bw_kbs = int(total_bw / 1024)
+
+        if headroom >= self._up_min_headroom:
+            self._consecutive_headroom_checks += 1
+        else:
+            self._consecutive_headroom_checks = 0
+
+        if not self._first_scale_done:
+            self._first_scale_done = True
+            self._consecutive_headroom_checks = 0
+            if headroom > 0:
+                new_count = min(self._configured_max_workers, current_workers + headroom)
+                return new_count, f"{measured_bw_kbs} KB/s, {headroom} slots headroom"
+            return current_workers, ""
+
+        if self._consecutive_headroom_checks >= self._up_confirm_checks:
+            self._consecutive_headroom_checks = 0
+            step = min(headroom, self._up_max_step)
+            new_count = min(self._configured_max_workers, current_workers + step)
+            return new_count, f"{measured_bw_kbs} KB/s, {headroom} slots headroom"
+
+        return current_workers, ""
