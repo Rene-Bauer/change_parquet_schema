@@ -188,6 +188,7 @@ class TransformWorker(QThread):
     resumed_signal = pyqtSignal()
     # Emitted after calibration: (calibrated_worker_count, measured_bandwidth_kbs)
     workers_calibrated = pyqtSignal(int, int)
+    log_message = pyqtSignal(str)
 
     def __init__(
         self,
@@ -268,8 +269,7 @@ class TransformWorker(QThread):
             blob_names = [b for b in blob_names if not self._checkpoint.should_skip(b)]
             skipped = before - len(blob_names)
             if skipped > 0:
-                self.file_error.emit(
-                    "(checkpoint)",
+                self.log_message.emit(
                     f"[Checkpoint] Resuming — skipping {skipped} already-processed file(s)"
                 )
 
@@ -283,13 +283,14 @@ class TransformWorker(QThread):
                 type_map = {e["name"]: e["type"] for e in self._failed_list.entries}
                 for name in extra:
                     entry_type = type_map.get(name, "unknown")
-                    self.file_error.emit(
-                        "(checkpoint)",
+                    self.log_message.emit(
                         f"[Failed List] Retrying previously failed file: {name} ({entry_type})"
                     )
 
         total = len(blob_names)
         if total == 0:
+            if self._checkpoint:
+                self._checkpoint.mark_complete()
             self.finished.emit(0, 0, 0, 0.0, 0.0, [])
             return
 
@@ -546,7 +547,7 @@ class TransformWorker(QThread):
 
         if self._checkpoint:
             self._checkpoint.mark_complete()
-            self.file_error.emit("(checkpoint)", "[Checkpoint] Run marked as complete")
+            self.log_message.emit("[Checkpoint] Run marked as complete")
 
         total_seconds = perf_counter() - start_time
         avg_seconds = (total_duration_ms / max(completed, 1)) / 1000.0 if completed else 0.0

@@ -539,8 +539,12 @@ class MainWindow(QMainWindow):
         - in_progress checkpoint → ask Resume / Start Fresh
         - failed entries present on resume → ask Retry Failed Files
         """
-        cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
-        fl = FailedList.load_or_create(container, prefix)
+        try:
+            cp = RunCheckpoint.load_or_create(container, prefix, output_prefix)
+            fl = FailedList.load_or_create(container, prefix)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Corrupt Checkpoint", str(exc))
+            return None
         retry_failed = False
         resuming = False
 
@@ -701,6 +705,7 @@ class MainWindow(QMainWindow):
         self._transform_worker.paused_signal.connect(self._on_worker_paused)
         self._transform_worker.resumed_signal.connect(self._on_worker_resumed)
         self._transform_worker.workers_calibrated.connect(self._on_workers_calibrated)
+        self._transform_worker.log_message.connect(self._log_info)
         self._transform_worker.start()
 
     # ------------------------------------------------------------------
