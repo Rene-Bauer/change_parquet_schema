@@ -20,6 +20,11 @@ class _UploadRecord(NamedTuple):
 
 
 class AdaptiveScaler:
+    """Adaptive worker-count scaler based on rolling upload throughput.
+
+    NOTE: `should_scale` is not thread-safe and must be called from a single thread only.
+    Only `record_upload` is safe for concurrent callers.
+    """
     def __init__(
         self,
         *,
@@ -69,4 +74,19 @@ class AdaptiveScaler:
         if total_seconds <= 0 or not successes:
             return current_workers, ""
 
-        return current_workers, ""  # scale logic added in Tasks 2 & 3
+        error_rate = 1.0 - (len(successes) / len(window))
+        per_file_tp = [b / s for b, s in successes if s > 0]
+
+        # --- Scale-DOWN (checked first, takes priority) ---
+        if len(per_file_tp) >= 4 and error_rate > self._down_error_rate:
+            full_median = statistics.median(per_file_tp)
+            recent_count = max(1, len(per_file_tp) // 4)
+            recent_median = statistics.median(per_file_tp[-recent_count:])
+            if full_median > 0 and recent_median < full_median * (1 - self._down_throughput_drop):
+                self._consecutive_headroom_checks = 0
+                self._first_scale_done = True
+                return max(1, current_workers - 1), (
+                    f"Fehlerrate {error_rate:.0%}, Throughput -{self._down_throughput_drop:.0%}"
+                )
+
+        return current_workers, ""  # scale-up added in Task 3
