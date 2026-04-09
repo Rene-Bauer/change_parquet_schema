@@ -62,8 +62,9 @@ def test_scale_down_triggers_on_combined_error_and_throughput_drop():
 
 
 def test_scale_down_does_not_trigger_on_errors_alone():
-    scaler = _make_scaler(min_samples=10, window_size=100, down_error_rate=0.15, down_throughput_drop=0.30, configured_max_workers=4)
+    scaler = _make_scaler(min_samples=10, window_size=100, down_error_rate=0.15, down_throughput_drop=0.30)
     _fill_scaler_with_good_uploads(scaler, 70, bytes_=5_000_000, seconds=5.0)
+    scaler.should_scale(4, 10_000_000)  # consume first proportional check
     for _ in range(20):
         scaler.record_upload(0, 0.0, False)  # 22% errors but throughput stable
     new_count, _ = scaler.should_scale(4, 10_000_000)
@@ -71,8 +72,9 @@ def test_scale_down_does_not_trigger_on_errors_alone():
 
 
 def test_scale_down_does_not_trigger_on_throughput_drop_alone():
-    scaler = _make_scaler(min_samples=10, window_size=100, down_error_rate=0.15, down_throughput_drop=0.30, configured_max_workers=4)
+    scaler = _make_scaler(min_samples=10, window_size=100, down_error_rate=0.15, down_throughput_drop=0.30)
     _fill_scaler_with_good_uploads(scaler, 40, bytes_=5_000_000, seconds=5.0)
+    scaler.should_scale(4, 10_000_000)  # consume first proportional check
     # Add slow uploads — but no errors
     for _ in range(60):
         scaler.record_upload(500_000, 5.0, True)  # slow but all succeed
