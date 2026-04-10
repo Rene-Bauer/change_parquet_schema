@@ -775,7 +775,7 @@ class MainWindow(QMainWindow):
         self._transform_worker.cancelled.connect(self._on_transform_cancelled)
         self._transform_worker.paused_signal.connect(self._on_worker_paused)
         self._transform_worker.resumed_signal.connect(self._on_worker_resumed)
-        self._transform_worker.workers_calibrated.connect(self._on_workers_calibrated)
+        self._transform_worker.workers_scaled.connect(self._on_workers_scaled)
         self._transform_worker.log_message.connect(self._log_info)
         self._transform_worker.start()
 
@@ -985,19 +985,13 @@ class MainWindow(QMainWindow):
             f"{remaining} file(s), waiting {delay}s (exponential back-off)..."
         )
 
-    def _on_workers_calibrated(self, calibrated_count: int, measured_bw_kbs: int) -> None:
-        """Called after the calibration pass measured real upload bandwidth."""
-        self._worker_spin.setValue(calibrated_count)
-        if measured_bw_kbs > 0:
-            self._log_info(
-                f"Auto-Scale: measured {measured_bw_kbs} KB/s upload bandwidth "
-                f"→ {calibrated_count} worker(s) for remaining files."
-            )
-        else:
-            self._log_info(
-                f"Auto-Scale: calibration had no measurable uploads "
-                f"→ keeping {calibrated_count} worker(s)."
-            )
+    def _on_workers_scaled(self, new_count: int, old_count: int, direction: str, reason: str) -> None:
+        """Called when the AdaptiveScaler adjusts the worker count."""
+        self._worker_spin.setValue(new_count)
+        arrow = "↑" if direction == "up" else "↓"
+        self._log_info(
+            f"[Autoscale {arrow}] {old_count}→{new_count} workers — {reason}"
+        )
 
     def _on_workers_reduced(self, new_count: int, conn_errors: int) -> None:
         self._worker_spin.setValue(new_count)

@@ -367,7 +367,7 @@ class TransformWorker(QThread):
                 old_count = self._worker_count
                 new_count, reason = scaler.should_scale(old_count, p95_bytes)
                 if new_count != old_count:
-                    self._worker_count = new_count
+                    self._worker_count = new_count  # GIL makes int assignment atomic in CPython
                     direction = "up" if new_count > old_count else "down"
                     self.workers_scaled.emit(new_count, old_count, direction, reason)
 
