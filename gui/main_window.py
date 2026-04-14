@@ -39,7 +39,7 @@ from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
-MAX_WORKERS = 32
+MAX_WORKERS = 256
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_LOG_ENTRIES = 5_000
 """Maximum number of log lines kept in memory. Oldest entries are dropped first."""
