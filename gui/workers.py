@@ -899,3 +899,115 @@ class TransformWorker(QThread):
             if field.type != expected:
                 return False
         return True
+
+
+# ---------------------------------------------------------------------------
+# Data Collector Worker
+# ---------------------------------------------------------------------------
+
+class DataCollectorWorker(QThread):
+    """
+    Downloads all Parquet blobs under source_prefix from Azure, filters rows
+    by filter_col matching any of filter_values, combines all matches into one
+    table, recalculates metadata, and uploads a single output file.
+    """
+
+    listing_complete = pyqtSignal(int)       # total blob count found
+    progress = pyqtSignal(int, int, str)     # (completed, total, blob_name)
+    file_error = pyqtSignal(str, str)        # (blob_name, error_message)
+    finished = pyqtSignal(dict)              # {"rowCount": int, "outputBlob": str} or {"rowCount": 0}
+    cancelled = pyqtSignal()
+    log_message = pyqtSignal(str)
+
+    def __init__(
+        self,
+        connection_string: str,
+        container: str,
+        source_prefix: str,
+        output_prefix: str,
+        filter_col: str,
+        filter_values: list[str],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._conn = connection_string
+        self._container_name = container
+        self._source_prefix = source_prefix
+        self._output_prefix = output_prefix
+        self._filter_col = filter_col
+        self._filter_values = filter_values
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from parquet_transform.collector import (
+            filter_table_by_ids,
+            build_metadata,
+            make_output_blob_name,
+        )
+
+        client = BlobStorageClient(self._conn, self._container_name)
+        try:
+            blobs = client.list_blobs(self._source_prefix)
+            self.listing_complete.emit(len(blobs))
+
+            chunks: list[pa.Table] = []
+
+            for idx, blob_name in enumerate(blobs):
+                if self._cancel_event.is_set():
+                    self.cancelled.emit()
+                    return
+                try:
+                    raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
+                    table = pq.read_table(io.BytesIO(raw))
+                    filtered = filter_table_by_ids(table, self._filter_col, self._filter_values)
+                    if filtered.num_rows > 0:
+                        chunks.append(filtered)
+                except Exception as exc:
+                    msg, _, _ = _summarize_exception(exc)
+                    self.file_error.emit(blob_name, msg)
+                self.progress.emit(idx + 1, len(blobs), blob_name)
+
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
+            if not chunks:
+                self.log_message.emit(
+                    f"Data-Collector: no rows matched "
+                    f"{self._filter_col} {self._filter_values}"
+                )
+                self.finished.emit({"rowCount": 0})
+                return
+
+            merged = pa.concat_tables(chunks)
+            meta = build_metadata(merged)
+
+            # Preserve existing metadata keys, overwrite recalculated ones
+            existing = merged.schema.metadata or {}
+            decoded = {
+                (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+                for k, v in existing.items()
+            }
+            decoded.update(meta)
+            merged = merged.replace_schema_metadata(decoded)
+
+            out_buf = io.BytesIO()
+            pq.write_table(merged, out_buf, compression="zstd", compression_level=3)
+
+            out_name = make_output_blob_name(
+                self._output_prefix, self._filter_col, self._filter_values
+            )
+            client.upload_bytes(out_name, out_buf.getvalue(), overwrite=True,
+                                timeout=UPLOAD_TIMEOUT_S)
+            self.log_message.emit(
+                f"Data-Collector: uploaded {out_name} ({merged.num_rows} rows)"
+            )
+            self.finished.emit({"rowCount": merged.num_rows, "outputBlob": out_name})
+
+        finally:
+            client.close()
