@@ -113,3 +113,19 @@ def test_make_output_blob_name_multiple_ids():
 def test_make_output_blob_name_strips_trailing_slash():
     name = make_output_blob_name("out/collected/", "SenderUid", ["uid1"])
     assert name == "out/collected/SenderUid_uid1.parquet"
+
+
+def test_build_metadata_missing_column_raises():
+    table = pa.table({"Id": ["a"], "SenderUid": ["uid1"]})  # missing required cols
+    with pytest.raises(ValueError, match="missing required columns"):
+        build_metadata(table)
+
+
+def test_filter_table_missing_column_raises():
+    with pytest.raises(ValueError, match="not found in table"):
+        filter_table_by_ids(_make_table(), "NonExistentCol", ["x"])
+
+
+def test_make_output_blob_name_empty_ids_raises():
+    with pytest.raises(ValueError, match="must not be empty"):
+        make_output_blob_name("out/", "SenderUid", [])
