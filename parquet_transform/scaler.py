@@ -551,3 +551,112 @@ class AdaptiveScaler:
             # β ≈ 0: pure contention model, throughput grows monotonically until the
             # hardware ceiling — set N_opt to max so Phase C doesn't block scale-up.
             self._usl_n_opt = self._configured_max_workers
+
+
+# ---------------------------------------------------------------------------
+# Collector Scaler
+# ---------------------------------------------------------------------------
+
+class CollectorScaler:
+    """
+    Scaling decisions for the Data-Collector producer-consumer architecture.
+
+    Scales worker count based on:
+    - RAM pressure (buffer fill vs. configured limit)
+    - Download error rate
+    - Hot-error spikes (immediate halving)
+
+    Unlike AdaptiveScaler, this class has no USL model — it uses simple
+    threshold-based rules appropriate for bounded-memory collection workloads.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        min_workers: int = 1,
+        window_size: int = 30,
+        min_samples: int = 5,
+        ram_high_water: float = 0.75,
+        ram_low_water: float = 0.35,
+        error_rate_threshold: float = 0.30,
+        hot_error_rate: float = 0.50,
+    ) -> None:
+        import threading as _threading
+        self._max_workers = max_workers
+        self._min_workers = min_workers
+        self._window_size = window_size
+        self._min_samples = min_samples
+        self._ram_high_water = ram_high_water
+        self._ram_low_water = ram_low_water
+        self._error_rate_threshold = error_rate_threshold
+        self._hot_error_rate = hot_error_rate
+
+        self._lock = _threading.Lock()
+        self._window: list[bool] = []   # True = success, False = failure
+        self._hot_flag: bool = False
+
+    def record_download(self, bytes_: int, seconds: float, success: bool) -> None:
+        with self._lock:
+            self._window.append(success)
+            if len(self._window) > self._window_size:
+                self._window.pop(0)
+            # Detect hot-error spike
+            if len(self._window) >= self._min_samples:
+                failures = self._window.count(False)
+                if failures / len(self._window) >= self._hot_error_rate:
+                    self._hot_flag = True
+
+    def window_ready(self) -> bool:
+        with self._lock:
+            return len(self._window) >= self._min_samples
+
+    def consume_hot_error_flag(self) -> bool:
+        with self._lock:
+            flag = self._hot_flag
+            self._hot_flag = False
+            return flag
+
+    def should_scale(
+        self,
+        current_workers: int,
+        ram_used_bytes: int,
+        ram_limit_bytes: int,
+    ) -> tuple[int, str]:
+        """Return (new_worker_count, reason). Returns current_workers and '' if no change."""
+        if not self.window_ready():
+            return current_workers, ""
+
+        with self._lock:
+            window = list(self._window)
+            hot = self._hot_flag
+            if hot:
+                self._hot_flag = False
+
+        error_rate = window.count(False) / len(window)
+        ram_pressure = ram_used_bytes / ram_limit_bytes if ram_limit_bytes > 0 else 0.0
+
+        # Priority 1: hot error spike → halve workers
+        if hot:
+            new = max(self._min_workers, current_workers // 2)
+            return new, f"hot error rate {error_rate:.0%}: halving workers"
+
+        # Priority 2: high RAM → scale down
+        if ram_pressure > self._ram_high_water:
+            new = max(self._min_workers, current_workers - 1)
+            if new != current_workers:
+                return new, f"RAM pressure {ram_pressure:.0%}: reducing workers"
+
+        # Priority 3: high error rate → scale down
+        if error_rate > self._error_rate_threshold:
+            new = max(self._min_workers, current_workers - 1)
+            if new != current_workers:
+                return new, f"error rate {error_rate:.0%}: reducing workers"
+
+        # Priority 4: low RAM + low errors → scale up
+        if ram_pressure < self._ram_low_water and error_rate < 0.10:
+            new = min(self._max_workers, current_workers + 1)
+            if new != current_workers:
+                return new, f"RAM pressure {ram_pressure:.0%}: adding worker"
+
+        return current_workers, ""
