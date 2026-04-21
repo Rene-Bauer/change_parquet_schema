@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QSpinBox,
     QStatusBar,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -39,6 +40,7 @@ from gui.resources_panel import ResourcesPanel
 from gui.schema_table import SchemaTable
 from gui.system_monitor_worker import SystemMonitorWorker
 from gui.workers import SchemaLoaderWorker, TransformWorker, _format_bytes
+from gui.collector_panel import CollectorPanel
 from parquet_transform.checkpoint import FailedList, RunCheckpoint
 
 # Derive a sensible worker cap from available RAM.
@@ -137,7 +139,15 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+
+        tabs = QTabWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(tabs)
+
+        # --- Tab 1: Schema Transformer (existing layout, completely unchanged) ---
+        transformer_widget = QWidget()
+        root = QVBoxLayout(transformer_widget)
         root.setSpacing(8)
         root.setContentsMargins(12, 12, 12, 12)
 
@@ -151,6 +161,11 @@ class MainWindow(QMainWindow):
         root.addWidget(self._resources_panel)
 
         root.addWidget(self._build_log_group())
+
+        tabs.addTab(transformer_widget, "Schema Transformer")
+
+        # --- Tab 2: Data Collector ---
+        tabs.addTab(CollectorPanel(), "Data Collector")
 
         self._build_statusbar()
 
