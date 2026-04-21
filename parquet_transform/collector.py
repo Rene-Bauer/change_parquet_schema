@@ -52,5 +52,73 @@ def make_output_blob_name(output_prefix: str, filter_col: str, filter_values: li
     if not filter_values:
         raise ValueError("filter_values must not be empty")
     prefix = output_prefix.rstrip("/")
-    ids_part = "_".join(filter_values)
+    ids_part = "_".join(v.replace(" ", "_") for v in filter_values)
     return f"{prefix}/{filter_col}_{ids_part}.parquet"
+
+
+class MetadataAccumulator:
+    """Incrementally tracks metadata values across multiple filtered chunks."""
+
+    def __init__(self) -> None:
+        self._total_rows: int = 0
+        self._min_ts = None
+        self._max_ts = None
+        self._triples: set[str] = set()
+
+    @property
+    def total_rows(self) -> int:
+        return self._total_rows
+
+    def update(self, chunk: pa.Table) -> None:
+        if chunk.num_rows == 0:
+            return
+        self._total_rows += chunk.num_rows
+        ts_col = chunk.column("TsCreate").cast(pa.timestamp("ms", tz="UTC"))
+        chunk_min = pc.min(ts_col).as_py()
+        chunk_max = pc.max(ts_col).as_py()
+        if self._min_ts is None or chunk_min < self._min_ts:
+            self._min_ts = chunk_min
+        if self._max_ts is None or chunk_max > self._max_ts:
+            self._max_ts = chunk_max
+        for s, d, v in zip(
+            chunk.column("SenderUid").to_pylist(),
+            chunk.column("DeviceUid").to_pylist(),
+            chunk.column("MessageVersion").to_pylist(),
+        ):
+            self._triples.add(f"{s} {d} {v}")
+
+    def to_metadata(self) -> dict[str, str]:
+        if self._total_rows == 0:
+            raise ValueError("No rows accumulated — cannot build metadata")
+
+        def _fmt(dt) -> str:
+            return dt.strftime("%m/%d/%Y %H:%M:%S +00:00")
+
+        return {
+            "recordCount": str(self._total_rows),
+            "dateFrom": _fmt(self._min_ts),
+            "dateTo": _fmt(self._max_ts),
+            "deviceIds": ",".join(sorted(self._triples)),
+            "batchNumber": "1",
+        }
+
+
+def rewrite_with_metadata(src_path: str, dst_path: str, metadata: dict[str, str]) -> None:
+    """Stream-copy a Parquet file to dst_path, merging metadata into the schema footer.
+
+    Existing metadata keys in src are preserved; keys in *metadata* overwrite them.
+    Uses iter_batches so peak RAM = one row group, not the full file.
+    """
+    import pyarrow.parquet as _pq
+
+    pf = _pq.ParquetFile(src_path)
+    existing = pf.schema_arrow.metadata or {}
+    decoded: dict[str, str] = {
+        (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+        for k, v in existing.items()
+    }
+    decoded.update(metadata)
+    schema_with_meta = pf.schema_arrow.with_metadata(decoded)
+    with _pq.ParquetWriter(dst_path, schema_with_meta, compression="zstd", compression_level=3) as w:
+        for batch in pf.iter_batches():
+            w.write_batch(batch)

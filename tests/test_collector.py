@@ -2,7 +2,13 @@
 import datetime
 import pyarrow as pa
 import pytest
-from parquet_transform.collector import filter_table_by_ids, build_metadata, make_output_blob_name
+from parquet_transform.collector import (
+    filter_table_by_ids,
+    build_metadata,
+    make_output_blob_name,
+    MetadataAccumulator,
+    rewrite_with_metadata,
+)
 
 
 def _ts_ms(year, month, day, hour, minute, second) -> int:
@@ -115,6 +121,16 @@ def test_make_output_blob_name_strips_trailing_slash():
     assert name == "out/collected/SenderUid_uid1.parquet"
 
 
+def test_make_output_blob_name_replaces_spaces_with_underscores():
+    name = make_output_blob_name("out/", "SenderUid", ["100413 156412 1.0"])
+    assert name == "out/SenderUid_100413_156412_1.0.parquet"
+
+
+def test_make_output_blob_name_multiple_ids_with_spaces():
+    name = make_output_blob_name("out/", "SenderUid", ["100413 156412 1.0", "100412 141978 1.0"])
+    assert name == "out/SenderUid_100413_156412_1.0_100412_141978_1.0.parquet"
+
+
 def test_build_metadata_missing_column_raises():
     table = pa.table({"Id": ["a"], "SenderUid": ["uid1"]})  # missing required cols
     with pytest.raises(ValueError, match="missing required columns"):
@@ -129,3 +145,98 @@ def test_filter_table_missing_column_raises():
 def test_make_output_blob_name_empty_ids_raises():
     with pytest.raises(ValueError, match="must not be empty"):
         make_output_blob_name("out/", "SenderUid", [])
+
+
+# --- MetadataAccumulator ---
+
+def test_accumulator_single_chunk():
+    acc = MetadataAccumulator()
+    acc.update(_make_table())
+    meta = acc.to_metadata()
+    assert meta["recordCount"] == "4"
+    assert meta["dateFrom"] == "04/14/2026 23:45:08 +00:00"
+    assert meta["dateTo"] == "04/14/2026 23:47:00 +00:00"
+    assert "uid1 dev1 1.0" in meta["deviceIds"]
+    assert meta["batchNumber"] == "1"
+
+
+def test_accumulator_multiple_chunks_combines_correctly():
+    acc = MetadataAccumulator()
+    table = _make_table()
+    acc.update(table.slice(0, 2))   # rows 0-1: uid1, uid2
+    acc.update(table.slice(2, 2))   # rows 2-3: uid1, uid3
+    meta = acc.to_metadata()
+    assert meta["recordCount"] == "4"
+    assert meta["dateFrom"] == "04/14/2026 23:45:08 +00:00"
+    assert meta["dateTo"] == "04/14/2026 23:47:00 +00:00"
+
+
+def test_accumulator_date_range_spans_chunks():
+    acc = MetadataAccumulator()
+    table = _make_table()
+    acc.update(table.slice(1, 2))   # rows 1-2 (middle timestamps)
+    acc.update(table.slice(0, 1))   # row 0 (earliest)
+    acc.update(table.slice(3, 1))   # row 3 (latest)
+    meta = acc.to_metadata()
+    assert meta["dateFrom"] == "04/14/2026 23:45:08 +00:00"
+    assert meta["dateTo"] == "04/14/2026 23:47:00 +00:00"
+
+
+def test_accumulator_empty_raises():
+    acc = MetadataAccumulator()
+    with pytest.raises(ValueError, match="No rows"):
+        acc.to_metadata()
+
+
+def test_accumulator_total_rows_property():
+    acc = MetadataAccumulator()
+    assert acc.total_rows == 0
+    acc.update(_make_table())
+    assert acc.total_rows == 4
+
+
+# --- rewrite_with_metadata ---
+
+def test_rewrite_with_metadata_produces_valid_parquet(tmp_path):
+    import pyarrow.parquet as pq
+
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_make_table(), str(src))
+
+    rewrite_with_metadata(str(src), str(dst), {"recordCount": "4", "batchNumber": "1"})
+
+    result = pq.read_table(str(dst))
+    assert result.num_rows == 4
+    meta = result.schema.metadata
+    assert meta[b"recordCount"] == b"4"
+
+
+def test_rewrite_with_metadata_preserves_rows(tmp_path):
+    import pyarrow.parquet as pq
+
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    original = _make_table()
+    pq.write_table(original, str(src))
+
+    rewrite_with_metadata(str(src), str(dst), {"recordCount": "4"})
+
+    result = pq.read_table(str(dst))
+    assert result["SenderUid"].to_pylist() == original["SenderUid"].to_pylist()
+
+
+def test_rewrite_preserves_existing_metadata_and_overwrites(tmp_path):
+    import pyarrow.parquet as pq
+
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    table = _make_table().replace_schema_metadata({"existingKey": "existingVal", "recordCount": "old"})
+    pq.write_table(table, str(src))
+
+    rewrite_with_metadata(str(src), str(dst), {"recordCount": "4"})
+
+    result = pq.read_table(str(dst))
+    meta = {k.decode(): v.decode() for k, v in result.schema.metadata.items()}
+    assert meta["existingKey"] == "existingVal"   # preserved
+    assert meta["recordCount"] == "4"             # overwritten
