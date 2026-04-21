@@ -942,8 +942,6 @@ class DataCollectorWorker(QThread):
         self._cancel_event.set()
 
     def run(self) -> None:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
         from parquet_transform.collector import (
             filter_table_by_ids,
             build_metadata,
