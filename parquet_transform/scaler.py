@@ -593,14 +593,12 @@ class CollectorScaler:
         self._hot_error_rate = hot_error_rate
 
         self._lock = _threading.Lock()
-        self._window: list[bool] = []   # True = success, False = failure
+        self._window: deque[bool] = deque(maxlen=window_size)   # True = success, False = failure
         self._hot_flag: bool = False
 
     def record_download(self, bytes_: int, seconds: float, success: bool) -> None:
         with self._lock:
             self._window.append(success)
-            if len(self._window) > self._window_size:
-                self._window.pop(0)
             # Detect hot-error spike
             if len(self._window) >= self._min_samples:
                 failures = self._window.count(False)
@@ -623,7 +621,10 @@ class CollectorScaler:
         ram_used_bytes: int,
         ram_limit_bytes: int,
     ) -> tuple[int, str]:
-        """Return (new_worker_count, reason). Returns current_workers and '' if no change."""
+        """Return (new_worker_count, reason). Returns current_workers and '' if no change.
+
+        Not thread-safe for concurrent callers — call from a single coordination thread.
+        """
         if not self.window_ready():
             return current_workers, ""
 
