@@ -26,7 +26,7 @@ def build_metadata(table: pa.Table) -> dict[str, str]:
     if table.num_rows == 0:
         raise ValueError("Cannot build metadata for empty table")
 
-    ts_col = table.column("TsCreate").cast(pa.timestamp("ms", tz="UTC"))
+    ts_col = _normalize_timestamp(table.column("TsCreate"))
     ts_min = pc.min(ts_col).as_py()
     ts_max = pc.max(ts_col).as_py()
 
@@ -73,7 +73,7 @@ class MetadataAccumulator:
         if chunk.num_rows == 0:
             return
         self._total_rows += chunk.num_rows
-        ts_col = chunk.column("TsCreate").cast(pa.timestamp("ms", tz="UTC"))
+        ts_col = _normalize_timestamp(chunk.column("TsCreate"))
         chunk_min = pc.min(ts_col).as_py()
         chunk_max = pc.max(ts_col).as_py()
         if self._min_ts is None or chunk_min < self._min_ts:
@@ -122,3 +122,15 @@ def rewrite_with_metadata(src_path: str, dst_path: str, metadata: dict[str, str]
     with _pq.ParquetWriter(dst_path, schema_with_meta, compression="zstd", compression_level=3) as w:
         for batch in pf.iter_batches():
             w.write_batch(batch)
+
+
+def _normalize_timestamp(column: pa.ChunkedArray) -> pa.ChunkedArray:
+    if not pa.types.is_timestamp(column.type):
+        raise ValueError("TsCreate must be a timestamp column")
+    target_tz = "UTC"
+    ts = column
+    if ts.type.tz is None:
+        ts = pc.assume_timezone(ts, target_tz)
+    elif ts.type.tz != target_tz:
+        ts = pc.convert_timezone(ts, target_tz)
+    return ts.cast(pa.timestamp("ms", tz=target_tz), safe=False)

@@ -957,8 +957,10 @@ class DataCollectorWorker(QThread):
         self._autoscale = autoscale
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
+        self._cancel_reason: str | None = None
 
     def cancel(self) -> None:
+        self._cancel_reason = "user"
         self._cancel_event.set()
 
     def run(self) -> None:
@@ -983,6 +985,8 @@ class DataCollectorWorker(QThread):
         # finally block can emit finished({rowCount:0}) if an unhandled
         # exception silently skipped all normal exit points (Issue 5).
         _emitted = [False]
+
+        self._cancel_reason = None
 
         try:
             source_client = BlobStorageClient(self._conn, self._container_name)
@@ -1023,6 +1027,11 @@ class DataCollectorWorker(QThread):
             os.close(tmp1_fd)
 
             writer_error: list = [None]
+            # Arrow schema used to create the ParquetWriter (set on first chunk).
+            # Subsequent chunks are cast to this schema with safe=False so that
+            # mixed-schema source files (e.g. some transformed to timestamp[ms,UTC],
+            # some still timestamp[ns]) don't abort the collection run.
+            writer_schema: list = [None]
 
             # ── Writer thread ─────────────────────────────────────────────
             def _writer_loop() -> None:
@@ -1038,15 +1047,25 @@ class DataCollectorWorker(QThread):
                             break
                         meta_acc.update(chunk)
                         if writer_ref[0] is None:
+                            writer_schema[0] = chunk.schema
                             writer_ref[0] = pq.ParquetWriter(
                                 tmp1_path, chunk.schema,
                                 compression="zstd", compression_level=3,
                             )
-                        writer_ref[0].write_table(chunk)
+                        # If this chunk's schema differs from the writer schema
+                        # (e.g. mixed timestamp[ns] / timestamp[ms,UTC] sources),
+                        # cast with safe=False so sub-ms precision is truncated
+                        # rather than aborting the entire collection run.
+                        write_chunk = chunk
+                        if not chunk.schema.equals(writer_schema[0], check_metadata=False):
+                            write_chunk = chunk.cast(writer_schema[0], safe=False)
+                        writer_ref[0].write_table(write_chunk)
                         with ram_lock:
                             ram_used[0] = max(0, ram_used[0] - chunk.nbytes)
                 except Exception as exc:  # noqa: BLE001
-                    writer_error[0] = str(exc)
+                    msg, _, _ = _summarize_exception(exc)
+                    writer_error[0] = msg
+                    self._cancel_reason = "writer_error"
                     self._cancel_event.set()  # unblock producers waiting on full chunk_queue
 
             writer_thread = threading.Thread(target=_writer_loop, daemon=True)
@@ -1106,7 +1125,14 @@ class DataCollectorWorker(QThread):
                                 done = completed[0]
                             # progress is safe to emit from threads (Qt queued delivery)
                             # file_error uses error_queue to guarantee delivery without an event loop
-                            self.progress.emit(done, total, blob_name)
+                            try:
+                                self.progress.emit(done, total, blob_name)
+                            except RuntimeError as exc:
+                                # Happens when the owning QObject (panel closed) was deleted
+                                # before the background producer threads drained.
+                                if "has been deleted" not in str(exc):
+                                    raise
+                                return
                 finally:
                     client.close()
 
@@ -1195,6 +1221,13 @@ class DataCollectorWorker(QThread):
                 chunk_queue.put(None)
                 writer_thread.join(timeout=5.0)
                 _emitted[0] = True
+                reason = self._cancel_reason or "user"
+                if reason == "writer_error" and writer_error[0]:
+                    self.log_message.emit(f"Data-Collector writer error: {writer_error[0]}")
+                elif reason == "user":
+                    self.log_message.emit("Data-Collector cancelled by user.")
+                else:
+                    self.log_message.emit(f"Data-Collector cancelled ({reason}).")
                 self.cancelled.emit()
                 return
 

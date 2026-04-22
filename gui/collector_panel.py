@@ -1,6 +1,7 @@
 """Self-contained Data-Collector panel widget."""
 from __future__ import annotations
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -22,11 +23,12 @@ from gui.workers import DataCollectorWorker
 
 
 class CollectorPanel(QWidget):
-    """Full Data-Collector UI — runs independently of the Schema Transformer tab."""
+    """Full Data-Collector UI â€” runs independently of the Schema Transformer tab."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._worker: DataCollectorWorker | None = None
+        self._worker_cleanup_timer: QTimer | None = None
 
         root = QVBoxLayout(self)
         root.setSpacing(8)
@@ -108,7 +110,7 @@ class CollectorPanel(QWidget):
         self._autoscale_check.toggled.connect(
             lambda checked: self._workers_spin.setEnabled(not checked)
         )
-        self._autoscale_check.setChecked(True)  # fires toggled(True) → slot disables spin
+        self._autoscale_check.setChecked(True)  # fires toggled(True) â†’ slot disables spin
         row3.addWidget(self._autoscale_check)
         row3.addSpacing(16)
         row3.addWidget(QLabel("RAM limit (MB):"))
@@ -183,7 +185,7 @@ class CollectorPanel(QWidget):
         self._progress.setVisible(True)
         self._log_info(
             f"Starting collection: {self._filter_combo.currentText()} "
-            f"{filter_values} → {output_prefix}"
+            f"{filter_values} â†’ {output_prefix}"
         )
 
         self._worker = DataCollectorWorker(
@@ -234,36 +236,50 @@ class CollectorPanel(QWidget):
             self._log_info(
                 f"Collection complete: {row_count} rows → [{out_container}] {out_blob}"
             )
-        if self._worker is not None:
-            # Wait for run() to fully return before dropping the Python reference.
-            # finished/cancelled are emitted BEFORE the finally block completes,
-            # so the OS thread may still be alive when this slot is called.
-            # Setting self._worker = None without wait() triggers Python's
-            # reference-count GC immediately, which calls the C++ QThread
-            # destructor while the thread is still running → crash.
-            self._worker.wait(2000)
-            self._worker.deleteLater()
-            self._worker = None
+        self._request_worker_cleanup()
 
     def _on_cancelled(self) -> None:
         self._collect_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
-        if self._worker is not None:
-            self._worker.wait(2000)  # same race as _on_finished — see comment above
-            self._worker.deleteLater()
-            self._worker = None
+        self._request_worker_cleanup()
 
     def _on_workers_scaled(self, new_count: int, old_count: int, direction: str, reason: str) -> None:
-        self._log_info(f"Workers {old_count}→{new_count} ({direction}): {reason}")
+        self._log_info(f"Workers {old_count}â†’{new_count} ({direction}): {reason}")
 
     def closeEvent(self, event) -> None:
         """Cancel any running worker and wait for it to exit before closing."""
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
-            self._worker.wait(5000)  # give it up to 5 s to finish cleanly
+            if not self._worker.wait(5000):
+                self._log_error("Data Collector is still stopping — close cancelled.")
+                event.ignore()
+                return
+        self._request_worker_cleanup(force=True)
         super().closeEvent(event)
+
+    def _request_worker_cleanup(self, force: bool = False) -> None:
+        """Dispose the worker only after its QThread stops running."""
+        if self._worker is None:
+            return
+        if force or not self._worker.isRunning():
+            self._finalize_worker()
+            return
+        if self._worker_cleanup_timer is None:
+            self._worker_cleanup_timer = QTimer(self)
+            self._worker_cleanup_timer.setSingleShot(True)
+            self._worker_cleanup_timer.timeout.connect(self._request_worker_cleanup)
+        if not self._worker_cleanup_timer.isActive():
+            self._worker_cleanup_timer.start(100)
+
+    def _finalize_worker(self) -> None:
+        if self._worker is None:
+            return
+        if self._worker_cleanup_timer is not None and self._worker_cleanup_timer.isActive():
+            self._worker_cleanup_timer.stop()
+        self._worker.deleteLater()
+        self._worker = None
 
     # ------------------------------------------------------------------
     # Logging helpers
