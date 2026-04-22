@@ -1231,14 +1231,34 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        """Stop background threads before the window closes."""
-        # Cancel any in-progress Data Collector run and wait for it to exit.
-        # Qt does not propagate closeEvent to child widgets, so we do it explicitly.
+        """Stop all background threads before the window closes.
+
+        Qt does not propagate closeEvent to child widgets, so every worker
+        that lives on a non-main thread must be explicitly stopped here.
+        Failing to do so causes "QThread: Destroyed while thread is still
+        running" and a process crash when Python GC collects the QThread
+        object while its run() method is still executing.
+        """
+        # 1. Data Collector (lives in CollectorPanel — not auto-propagated).
         self._collector_panel.closeEvent(event)
         if not event.isAccepted():
             return
+
+        # 2. Schema Transformer worker.
+        #    cancel() sets the cancel_event and unblocks paused threads;
+        #    the run_pass join loop checks the event and exits promptly.
+        if self._transform_worker is not None and self._transform_worker.isRunning():
+            self._transform_worker.cancel()
+            self._transform_worker.wait(10_000)  # <1 s after join-loop fix
+
+        # 3. Schema Loader worker (no cancel mechanism; Azure calls are fast).
+        #    Wait up to 5 s — enough for list_blobs + one-file schema read.
+        if self._schema_worker is not None and self._schema_worker.isRunning():
+            self._schema_worker.wait(5_000)
+
+        # 4. System monitor.
         self._sys_monitor.stop()
-        self._sys_monitor.wait(2000)   # give it up to 2 s to exit cleanly
+        self._sys_monitor.wait(2000)
         super().closeEvent(event)
 
     # ------------------------------------------------------------------

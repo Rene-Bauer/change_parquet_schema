@@ -682,10 +682,15 @@ class TransformWorker(QThread):
             _spawn_workers(worker_total)
 
             # Wait for all threads, including those dynamically spawned during scale-up.
+            # On cancel: exit the loop immediately — worker threads are daemon=True
+            # and will be killed when the process exits.  Waiting here after cancel
+            # would block window close for the full download/upload timeout (Issue 3).
             while True:
                 with _threads_lock:
                     alive = [t for t in _threads if t.is_alive()]
                 if not alive:
+                    break
+                if self._cancel_event.is_set():
                     break
                 for t in alive:
                     t.join(timeout=0.5)
@@ -974,6 +979,10 @@ class DataCollectorWorker(QThread):
         writer_ref: list = [None]
         writer_stop = threading.Event()
         writer_thread: threading.Thread | None = None
+        # Sentinel: set to True before every terminal signal emit so the
+        # finally block can emit finished({rowCount:0}) if an unhandled
+        # exception silently skipped all normal exit points (Issue 5).
+        _emitted = [False]
 
         try:
             source_client = BlobStorageClient(self._conn, self._container_name)
@@ -987,6 +996,7 @@ class DataCollectorWorker(QThread):
             self.listing_complete.emit(total)
 
             if not blobs:
+                _emitted[0] = True
                 self.finished.emit({"rowCount": 0})
                 return
 
@@ -1162,11 +1172,16 @@ class DataCollectorWorker(QThread):
 
                 time.sleep(0.05)
 
-            # Wait for all producers
+            # Wait for all producers.
+            # On cancel: skip the join — producer threads are daemon=True and will
+            # be killed when the process exits.  Joining them here could block for
+            # up to DOWNLOAD_TIMEOUT_S per thread (hundreds of seconds total with
+            # many workers), far exceeding the 5 s window-close wait (Issue 2).
             with _threads_lock:
                 all_threads = list(_threads)
-            for t in all_threads:
-                t.join(timeout=5.0)
+            if not self._cancel_event.is_set():
+                for t in all_threads:
+                    t.join(timeout=5.0)
 
             # Final drain of any errors buffered during the last tick
             while not error_queue.empty():
@@ -1179,6 +1194,7 @@ class DataCollectorWorker(QThread):
             if self._cancel_event.is_set():
                 chunk_queue.put(None)
                 writer_thread.join(timeout=5.0)
+                _emitted[0] = True
                 self.cancelled.emit()
                 return
 
@@ -1187,11 +1203,13 @@ class DataCollectorWorker(QThread):
             writer_thread.join(timeout=60.0)
             if writer_thread.is_alive():
                 self.log_message.emit("Data-Collector writer thread timed out — aborting")
+                _emitted[0] = True
                 self.finished.emit({"rowCount": 0})
                 return
 
             if writer_error[0]:
                 self.log_message.emit(f"Data-Collector writer error: {writer_error[0]}")
+                _emitted[0] = True
                 self.finished.emit({"rowCount": 0})
                 return
 
@@ -1204,6 +1222,7 @@ class DataCollectorWorker(QThread):
                     f"Data-Collector: no rows matched "
                     f"{self._filter_col} {self._filter_values}"
                 )
+                _emitted[0] = True
                 self.finished.emit({"rowCount": 0})
                 return
 
@@ -1225,11 +1244,17 @@ class DataCollectorWorker(QThread):
                 f"Data-Collector: uploaded {out_name} → "
                 f"{self._output_container} ({meta_acc.total_rows} rows)"
             )
+            _emitted[0] = True
             self.finished.emit({
                 "rowCount": meta_acc.total_rows,
                 "outputBlob": out_name,
                 "outputContainer": self._output_container,
             })
+
+        except Exception as exc:  # noqa: BLE001
+            # Catches unhandled errors (e.g. upload failure, metadata rewrite)
+            # that would otherwise exit run() silently — leaving the UI frozen.
+            self.log_message.emit(f"Data-Collector unexpected error: {exc}")
 
         finally:
             # Signal and join writer thread before closing/unlinking to avoid
@@ -1252,3 +1277,7 @@ class DataCollectorWorker(QThread):
                         os.unlink(p)
                     except Exception:
                         pass
+            # Ensure the UI is never left frozen if an unhandled exception
+            # bypassed all normal exit paths without emitting a terminal signal.
+            if not _emitted[0]:
+                self.finished.emit({"rowCount": 0})
