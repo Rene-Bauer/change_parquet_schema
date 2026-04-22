@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -56,6 +58,11 @@ class CollectorPanel(QWidget):
         self._container_edit.setPlaceholderText("my-container")
         layout.addWidget(self._container_edit, stretch=1)
 
+        layout.addWidget(QLabel("Output container:"))
+        self._output_container_edit = QLineEdit()
+        self._output_container_edit.setPlaceholderText("leave empty = same container")
+        layout.addWidget(self._output_container_edit, stretch=1)
+
         return box
 
     def _build_filter_group(self) -> QGroupBox:
@@ -88,6 +95,32 @@ class CollectorPanel(QWidget):
         self._output_edit.setPlaceholderText("collected/")
         row2.addWidget(self._output_edit, stretch=1)
         layout.addLayout(row2)
+
+        # Row 3: worker count + autoscale + RAM limit
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Workers:"))
+        self._workers_spin = QSpinBox()
+        self._workers_spin.setRange(1, 64)
+        self._workers_spin.setValue(4)
+        self._workers_spin.setFixedWidth(60)
+        row3.addWidget(self._workers_spin)
+        self._autoscale_check = QCheckBox("Autoscale")
+        self._autoscale_check.setChecked(True)
+        self._workers_spin.setEnabled(False)   # disabled when autoscale on
+        self._autoscale_check.toggled.connect(
+            lambda checked: self._workers_spin.setEnabled(not checked)
+        )
+        row3.addWidget(self._autoscale_check)
+        row3.addSpacing(16)
+        row3.addWidget(QLabel("RAM limit (MB):"))
+        self._ram_spin = QSpinBox()
+        self._ram_spin.setRange(128, 8192)
+        self._ram_spin.setValue(1024)
+        self._ram_spin.setSingleStep(128)
+        self._ram_spin.setFixedWidth(80)
+        row3.addWidget(self._ram_spin)
+        row3.addStretch()
+        layout.addLayout(row3)
 
         return box
 
@@ -161,6 +194,10 @@ class CollectorPanel(QWidget):
             output_prefix=output_prefix,
             filter_col=self._filter_combo.currentText(),
             filter_values=filter_values,
+            output_container=self._output_container_edit.text().strip(),
+            max_workers=self._workers_spin.value(),
+            ram_limit_mb=self._ram_spin.value(),
+            autoscale=self._autoscale_check.isChecked(),
         )
         self._worker.listing_complete.connect(self._on_listing_complete)
         self._worker.progress.connect(self._on_progress)
@@ -168,6 +205,7 @@ class CollectorPanel(QWidget):
         self._worker.finished.connect(self._on_finished)
         self._worker.cancelled.connect(self._on_cancelled)
         self._worker.log_message.connect(self._log_info)
+        self._worker.workers_scaled.connect(self._on_workers_scaled)
         self._worker.start()
 
     def _on_cancel(self) -> None:
@@ -193,8 +231,9 @@ class CollectorPanel(QWidget):
             self._log_info("Collection complete: no matching rows found.")
         else:
             out_blob = result.get("outputBlob", "")
+            out_container = result.get("outputContainer", "")
             self._log_info(
-                f"Collection complete: {row_count} rows → {out_blob}"
+                f"Collection complete: {row_count} rows → [{out_container}] {out_blob}"
             )
         if self._worker is not None:
             self._worker.deleteLater()
@@ -208,6 +247,9 @@ class CollectorPanel(QWidget):
         if self._worker is not None:
             self._worker.deleteLater()
             self._worker = None
+
+    def _on_workers_scaled(self, new_count: int, old_count: int, direction: str, reason: str) -> None:
+        self._log_info(f"Workers {old_count}→{new_count} ({direction}): {reason}")
 
     # ------------------------------------------------------------------
     # Logging helpers
