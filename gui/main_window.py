@@ -173,6 +173,9 @@ class MainWindow(QMainWindow):
         # Start background system monitor (runs for the whole app lifetime)
         self._sys_monitor = SystemMonitorWorker(interval_ms=1000, parent=self)
         self._sys_monitor.snapshot_ready.connect(self._resources_panel.update_snapshot)
+        self._sys_monitor.snapshot_ready.connect(
+            self._collector_panel.resources_panel.update_snapshot
+        )
         self._sys_monitor.start()
 
         self._set_ready_state()
