@@ -301,8 +301,8 @@ class MainWindow(QMainWindow):
             "Processes the first few files with 2 workers, measures throughput,\n"
             "then scales up to the optimal number for your connection."
         )
-        self._autoscale_check.setChecked(True)
         self._autoscale_check.toggled.connect(self._on_autoscale_toggled)
+        self._autoscale_check.setChecked(True)  # fires toggled(True) → slot disables spinner
 
         attempts_label = QLabel("Attempts:")
         attempts_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
