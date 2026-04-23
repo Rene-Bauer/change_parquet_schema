@@ -252,3 +252,41 @@ def test_selected_columns_defaults_to_none():
         filter_values=["uid1"],
     )
     assert w._selected_columns is None
+
+
+# --- pause / resume ---
+
+def test_pause_event_starts_set():
+    """Worker starts in unpaused state."""
+    w = _make_worker()
+    assert w._pause_event.is_set()
+
+
+def test_pause_clears_event_and_resume_sets_it():
+    w = _make_worker()
+    w.pause()
+    assert not w._pause_event.is_set()
+    w.resume()
+    assert w._pause_event.is_set()
+
+
+def test_cancel_unblocks_paused_worker():
+    """cancel() must set the pause event so blocked producers can exit."""
+    w = _make_worker()
+    w.pause()
+    assert not w._pause_event.is_set()
+    w.cancel()
+    assert w._pause_event.is_set()
+
+
+def test_pause_resume_signals_emitted():
+    """pause() emits paused_signal; resume() emits resumed_signal."""
+    w = _make_worker()
+    paused = []
+    resumed = []
+    w.paused_signal.connect(lambda: paused.append(True))
+    w.resumed_signal.connect(lambda: resumed.append(True))
+    w.pause()
+    w.resume()
+    assert paused == [True]
+    assert resumed == [True]

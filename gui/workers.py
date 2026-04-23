@@ -929,6 +929,8 @@ class DataCollectorWorker(QThread):
     cancelled = pyqtSignal()
     log_message = pyqtSignal(str)
     workers_scaled = pyqtSignal(int, int, str, str)
+    paused_signal = pyqtSignal()
+    resumed_signal = pyqtSignal()
 
     def __init__(
         self,
@@ -959,11 +961,22 @@ class DataCollectorWorker(QThread):
         self._selected_columns = selected_columns
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # starts unpaused
         self._cancel_reason: str | None = None
 
     def cancel(self) -> None:
         self._cancel_reason = "user"
         self._cancel_event.set()
+        self._pause_event.set()  # unblock any paused producers so they can exit
+
+    def pause(self) -> None:
+        self._pause_event.clear()
+        self.paused_signal.emit()
+
+    def resume(self) -> None:
+        self._pause_event.set()
+        self.resumed_signal.emit()
 
     def run(self) -> None:
         import os
@@ -1096,6 +1109,9 @@ class DataCollectorWorker(QThread):
                         try:
                             blob_name = task_queue.get_nowait()
                         except queue.Empty:
+                            return
+                        self._pause_event.wait()   # block here when paused
+                        if self._cancel_event.is_set():
                             return
                         matched_rows: int = 0
                         try:
