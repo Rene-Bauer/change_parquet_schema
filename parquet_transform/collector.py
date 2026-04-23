@@ -60,6 +60,8 @@ def make_output_blob_name(
     """
     if not filter_values:
         raise ValueError("filter_values must not be empty")
+    if part is not None and part < 1:
+        raise ValueError(f"part must be a positive integer, got {part!r}")
     prefix = output_prefix.rstrip("/")
     ids_part = "_".join(v.replace(" ", "_") for v in filter_values)
     base = f"{prefix}/{filter_col}_{ids_part}"
