@@ -71,3 +71,46 @@ def test_schema_table_initially_hidden():
     panel = CollectorPanel()
     # The schema group should be hidden until Load Schema is triggered
     assert not panel._schema_group.isVisible()
+
+
+def test_pause_btn_exists_and_disabled_initially():
+    panel = CollectorPanel()
+    assert hasattr(panel, '_pause_btn')
+    assert not panel._pause_btn.isEnabled()
+    assert panel._pause_btn.text() == "Pause"
+
+
+def test_pause_btn_is_not_paused_initially():
+    panel = CollectorPanel()
+    assert hasattr(panel, '_is_paused')
+    assert panel._is_paused is False
+
+
+def test_on_worker_paused_updates_button_and_flag():
+    panel = CollectorPanel()
+    panel._on_worker_paused()
+    assert panel._is_paused is True
+    assert panel._pause_btn.text() == "Resume"
+
+
+def test_on_worker_resumed_updates_button_and_flag():
+    panel = CollectorPanel()
+    panel._is_paused = True
+    panel._pause_btn.setText("Resume")
+    panel._on_worker_resumed()
+    assert panel._is_paused is False
+    assert panel._pause_btn.text() == "Pause"
+
+
+def test_on_finished_disables_pause_btn():
+    panel = CollectorPanel()
+    panel._pause_btn.setEnabled(True)
+    panel._on_finished({"rowCount": 0})
+    assert not panel._pause_btn.isEnabled()
+
+
+def test_on_cancelled_disables_pause_btn():
+    panel = CollectorPanel()
+    panel._pause_btn.setEnabled(True)
+    panel._on_cancelled()
+    assert not panel._pause_btn.isEnabled()

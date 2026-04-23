@@ -31,6 +31,7 @@ class CollectorPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._worker: DataCollectorWorker | None = None
+        self._is_paused: bool = False
         self._worker_cleanup_timer: QTimer | None = None
         self._schema_worker: SchemaLoaderWorker | None = None
 
@@ -170,15 +171,20 @@ class CollectorPanel(QWidget):
         self._collect_btn = QPushButton("Collect")
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setEnabled(False)
+        self._pause_btn = QPushButton("Pause")
+        self._pause_btn.setFixedWidth(80)
+        self._pause_btn.setEnabled(False)
         self._progress = QProgressBar()
         self._progress.setVisible(False)
 
         layout.addWidget(self._collect_btn)
         layout.addWidget(self._cancel_btn)
+        layout.addWidget(self._pause_btn)
         layout.addWidget(self._progress, stretch=1)
 
         self._collect_btn.clicked.connect(self._on_collect)
         self._cancel_btn.clicked.connect(self._on_cancel)
+        self._pause_btn.clicked.connect(self._on_pause_resume)
 
         return widget
 
@@ -273,6 +279,9 @@ class CollectorPanel(QWidget):
 
         self._collect_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
+        self._pause_btn.setEnabled(True)
+        self._pause_btn.setText("Pause")
+        self._is_paused = False
         self._progress.setValue(0)
         self._progress.setVisible(True)
         col_note = (
@@ -303,11 +312,31 @@ class CollectorPanel(QWidget):
         self._worker.cancelled.connect(self._on_cancelled)
         self._worker.log_message.connect(self._log_info)
         self._worker.workers_scaled.connect(self._on_workers_scaled)
+        self._worker.paused.connect(self._on_worker_paused)
+        self._worker.resumed.connect(self._on_worker_resumed)
         self._worker.start()
 
     def _on_cancel(self) -> None:
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
+
+    def _on_pause_resume(self) -> None:
+        if not self._worker or not self._worker.isRunning():
+            return
+        if self._is_paused:
+            self._worker.resume()
+        else:
+            self._worker.pause()
+
+    def _on_worker_paused(self) -> None:
+        self._is_paused = True
+        self._pause_btn.setText("Resume")
+        self._log_info("Collection paused.")
+
+    def _on_worker_resumed(self) -> None:
+        self._is_paused = False
+        self._pause_btn.setText("Pause")
+        self._log_info("Collection resumed.")
 
     def _on_listing_complete(self, total: int) -> None:
         self._progress.setMaximum(total)
@@ -325,6 +354,9 @@ class CollectorPanel(QWidget):
     def _on_finished(self, result: dict) -> None:
         self._collect_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setText("Pause")
+        self._is_paused = False
         self._progress.setVisible(False)
         row_count = result.get("rowCount", 0)
         if row_count == 0:
@@ -341,6 +373,9 @@ class CollectorPanel(QWidget):
     def _on_cancelled(self) -> None:
         self._collect_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setText("Pause")
+        self._is_paused = False
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
         self._resources_panel.clear_worker_throughput()
