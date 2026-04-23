@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 from gui.collector_schema_table import CollectorSchemaTable
 from gui.resources_panel import ResourcesPanel
 from gui.workers import DataCollectorWorker, SchemaLoaderWorker
+from parquet_transform.collector import _REQUIRED_COLS
 
 
 class CollectorPanel(QWidget):
@@ -222,11 +223,16 @@ class CollectorPanel(QWidget):
         unknown_size_names: list[str],
     ) -> None:
         self._schema_table.load_schema(schema)
+        # Lock the four columns that MetadataAccumulator always needs for the
+        # Parquet footer (dateFrom/dateTo/recordCount/deviceIds).  Without them
+        # the writer thread crashes with a KeyError when building metadata.
+        self._schema_table.lock_columns(sorted(_REQUIRED_COLS))
         self._schema_group.setVisible(True)
         plural = "s" if file_count != 1 else ""
+        locked_str = ", ".join(sorted(_REQUIRED_COLS))
         self._log_info(
             f"Schema loaded: {len(schema)} column(s), {file_count} file{plural}. "
-            f"All columns selected by default — uncheck any to exclude."
+            f"Required columns locked: {locked_str}."
         )
 
     def _on_schema_error(self, msg: str) -> None:
@@ -307,8 +313,11 @@ class CollectorPanel(QWidget):
         self._progress.setMaximum(total)
         self._log_info(f"Found {total} Parquet blobs to scan.")
 
-    def _on_progress(self, completed: int, total: int, blob_name: str) -> None:
+    def _on_progress(self, completed: int, total: int, blob_name: str, matched_rows: int) -> None:
         self._progress.setValue(completed)
+        if matched_rows > 0:
+            short = blob_name.rsplit("/", 1)[-1]  # just the filename, not the full path
+            self._log_info(f"  [{completed}/{total}] {short}: {matched_rows} row(s) matched")
 
     def _on_file_error(self, blob_name: str, error: str) -> None:
         self._log_error(f"[{blob_name}]: {error}")

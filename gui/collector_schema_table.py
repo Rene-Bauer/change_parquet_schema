@@ -23,6 +23,10 @@ class CollectorSchemaTable(QWidget):
     ``get_selected_columns()`` to retrieve the projection list.
     Returns ``None`` when all columns are checked (no projection needed).
     Returns an empty list when no columns are checked.
+
+    Call ``lock_columns(names)`` after ``load_schema`` to mark columns as
+    required — their checkboxes are always checked and disabled so the user
+    cannot accidentally exclude columns the backend needs for metadata.
     """
 
     _COL_NAME = 0
@@ -30,6 +34,7 @@ class CollectorSchemaTable(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._locked_names: set[str] = set()
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -87,9 +92,33 @@ class CollectorSchemaTable(QWidget):
         self._update_count_label()
 
     def clear_schema(self) -> None:
-        """Remove all rows and reset the count label."""
+        """Remove all rows, reset the count label, and clear locked columns."""
         self._table.setRowCount(0)
+        self._locked_names = set()
         self._count_label.setText("No schema loaded")
+
+    def lock_columns(self, names: list[str]) -> None:
+        """Mark columns as required: always checked, checkbox disabled.
+
+        Call this after ``load_schema``.  Locked columns are included in
+        ``get_selected_columns()`` regardless of what the user does, and
+        ``_on_deselect_all`` skips them so they stay checked.
+        """
+        self._locked_names = set(names)
+        for row in range(self._table.rowCount()):
+            widget = self._table.cellWidget(row, self._COL_NAME)
+            if widget is None:
+                continue
+            is_locked = widget.text() in self._locked_names
+            widget.setEnabled(not is_locked)
+            if is_locked:
+                widget.setChecked(True)
+                widget.setToolTip(
+                    "Required for Parquet footer metadata — cannot be excluded"
+                )
+            else:
+                widget.setToolTip("")
+        self._update_count_label()
 
     def get_selected_columns(self) -> list[str] | None:
         """Return checked column names, or None if all columns are checked.
@@ -117,7 +146,11 @@ class CollectorSchemaTable(QWidget):
 
     def _on_deselect_all(self) -> None:
         for row in range(self._table.rowCount()):
-            self._table.cellWidget(row, self._COL_NAME).setChecked(False)
+            widget = self._table.cellWidget(row, self._COL_NAME)
+            if widget is None:
+                continue
+            if widget.text() not in self._locked_names:
+                widget.setChecked(False)
 
     def _update_count_label(self, _state: int = 0) -> None:
         total = self._table.rowCount()

@@ -68,3 +68,40 @@ def test_clear_schema_resets_widget():
     assert w._table.rowCount() == 0
     assert "No schema loaded" in w._count_label.text()
     assert w.get_selected_columns() is None  # empty table → None
+
+
+def test_lock_columns_disables_checkbox():
+    w = CollectorSchemaTable()
+    w.load_schema(_schema())
+    w.lock_columns(["SenderUid"])
+    from PyQt6.QtWidgets import QCheckBox
+    check: QCheckBox = w._table.cellWidget(1, 0)  # SenderUid is row 1
+    assert not check.isEnabled()
+    assert check.isChecked()
+
+
+def test_deselect_all_skips_locked_columns():
+    w = CollectorSchemaTable()
+    w.load_schema(_schema())
+    w.lock_columns(["SenderUid"])
+    w._on_deselect_all()
+    cols = w.get_selected_columns()
+    # Only SenderUid should remain (locked); Id and TsCreate are unchecked
+    assert cols == ["SenderUid"]
+
+
+def test_lock_columns_tooltip_set():
+    w = CollectorSchemaTable()
+    w.load_schema(_schema())
+    w.lock_columns(["TsCreate"])
+    from PyQt6.QtWidgets import QCheckBox
+    check: QCheckBox = w._table.cellWidget(2, 0)  # TsCreate is row 2
+    assert "Required" in check.toolTip()
+
+
+def test_clear_schema_resets_locked_columns():
+    w = CollectorSchemaTable()
+    w.load_schema(_schema())
+    w.lock_columns(["SenderUid"])
+    w.clear_schema()
+    assert w._locked_names == set()

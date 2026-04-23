@@ -923,7 +923,7 @@ class DataCollectorWorker(QThread):
     """
 
     listing_complete = pyqtSignal(int)
-    progress = pyqtSignal(int, int, str)
+    progress = pyqtSignal(int, int, str, int)   # completed, total, blob_name, matched_rows
     file_error = pyqtSignal(str, str)
     finished = pyqtSignal(dict)
     cancelled = pyqtSignal()
@@ -1097,6 +1097,7 @@ class DataCollectorWorker(QThread):
                             blob_name = task_queue.get_nowait()
                         except queue.Empty:
                             return
+                        matched_rows: int = 0
                         try:
                             t0 = time.monotonic()
                             raw = client.download_bytes(blob_name, timeout=DOWNLOAD_TIMEOUT_S)
@@ -1105,6 +1106,7 @@ class DataCollectorWorker(QThread):
                             filtered = filter_table_by_ids(
                                 table, self._filter_col, self._filter_values
                             )
+                            matched_rows = filtered.num_rows  # capture before column projection
                             if self._selected_columns is not None:
                                 filtered = filtered.select(self._selected_columns)
                             if scaler is not None:
@@ -1130,7 +1132,7 @@ class DataCollectorWorker(QThread):
                             # progress is safe to emit from threads (Qt queued delivery)
                             # file_error uses error_queue to guarantee delivery without an event loop
                             try:
-                                self.progress.emit(done, total, blob_name)
+                                self.progress.emit(done, total, blob_name, matched_rows)
                             except RuntimeError as exc:
                                 # Happens when the owning QObject (panel closed) was deleted
                                 # before the background producer threads drained.
