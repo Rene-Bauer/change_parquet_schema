@@ -59,3 +59,15 @@ def test_close_event_blocks_when_worker_is_still_running():
     assert not event.isAccepted()
     assert worker.cancel_calls == 1
     assert panel._worker is worker
+
+
+def test_panel_exposes_resources_panel():
+    from gui.resources_panel import ResourcesPanel
+    panel = CollectorPanel()
+    assert isinstance(panel.resources_panel, ResourcesPanel)
+
+
+def test_schema_table_initially_hidden():
+    panel = CollectorPanel()
+    # The schema group should be hidden until Load Schema is triggered
+    assert not panel._schema_group.isVisible()

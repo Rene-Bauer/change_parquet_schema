@@ -19,16 +19,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gui.workers import DataCollectorWorker
+from gui.collector_schema_table import CollectorSchemaTable
+from gui.resources_panel import ResourcesPanel
+from gui.workers import DataCollectorWorker, SchemaLoaderWorker
 
 
 class CollectorPanel(QWidget):
-    """Full Data-Collector UI â€” runs independently of the Schema Transformer tab."""
+    """Full Data-Collector UI — runs independently of the Schema Transformer tab."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._worker: DataCollectorWorker | None = None
         self._worker_cleanup_timer: QTimer | None = None
+        self._schema_worker: SchemaLoaderWorker | None = None
 
         root = QVBoxLayout(self)
         root.setSpacing(8)
@@ -36,8 +39,26 @@ class CollectorPanel(QWidget):
 
         root.addWidget(self._build_connection_group())
         root.addWidget(self._build_filter_group())
+
+        self._schema_group = self._build_schema_group()
+        self._schema_group.setVisible(False)
+        root.addWidget(self._schema_group)
+
         root.addWidget(self._build_action_row())
+
+        self._resources_panel = ResourcesPanel()
+        root.addWidget(self._resources_panel)
+
         root.addWidget(self._build_log_group())
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def resources_panel(self) -> ResourcesPanel:
+        """Exposed so MainWindow can connect SystemMonitorWorker to it."""
+        return self._resources_panel
 
     # ------------------------------------------------------------------
     # Panel builders
@@ -91,6 +112,14 @@ class CollectorPanel(QWidget):
         self._source_edit = QLineEdit()
         self._source_edit.setPlaceholderText("transformed/data/")
         row2.addWidget(self._source_edit, stretch=1)
+        self._load_schema_btn = QPushButton("Load Schema")
+        self._load_schema_btn.setFixedWidth(110)
+        self._load_schema_btn.setToolTip(
+            "Read the schema from the first Parquet file under Source prefix.\n"
+            "Use Column Selection to pick which columns to include."
+        )
+        self._load_schema_btn.clicked.connect(self._on_load_schema)
+        row2.addWidget(self._load_schema_btn)
         row2.addSpacing(16)
         row2.addWidget(QLabel("Output prefix:"))
         self._output_edit = QLineEdit()
@@ -110,7 +139,7 @@ class CollectorPanel(QWidget):
         self._autoscale_check.toggled.connect(
             lambda checked: self._workers_spin.setEnabled(not checked)
         )
-        self._autoscale_check.setChecked(True)  # fires toggled(True) â†’ slot disables spin
+        self._autoscale_check.setChecked(True)  # fires toggled(True) → slot disables spin
         row3.addWidget(self._autoscale_check)
         row3.addSpacing(16)
         row3.addWidget(QLabel("RAM limit (MB):"))
@@ -123,6 +152,13 @@ class CollectorPanel(QWidget):
         row3.addStretch()
         layout.addLayout(row3)
 
+        return box
+
+    def _build_schema_group(self) -> QGroupBox:
+        box = QGroupBox("Column Selection")
+        layout = QVBoxLayout(box)
+        self._schema_table = CollectorSchemaTable()
+        layout.addWidget(self._schema_table)
         return box
 
     def _build_action_row(self) -> QWidget:
@@ -158,6 +194,50 @@ class CollectorPanel(QWidget):
     # Slots
     # ------------------------------------------------------------------
 
+    def _on_load_schema(self) -> None:
+        conn = self._conn_edit.text().strip()
+        container = self._container_edit.text().strip()
+        source_prefix = self._source_edit.text().strip()
+
+        if not conn or not container:
+            self._log_error("Connection string and container are required.")
+            return
+
+        self._load_schema_btn.setEnabled(False)
+        self._schema_table.clear_schema()
+        self._schema_group.setVisible(False)
+        self._log_info(f"Loading schema from '{source_prefix}'…")
+
+        self._schema_worker = SchemaLoaderWorker(conn, container, source_prefix)
+        self._schema_worker.schema_loaded.connect(self._on_schema_loaded)
+        self._schema_worker.error.connect(self._on_schema_error)
+        self._schema_worker.finished.connect(self._on_schema_worker_finished)
+        self._schema_worker.start()
+
+    def _on_schema_loaded(
+        self,
+        schema,
+        file_count: int,
+        total_bytes: int,
+        unknown_size_names: list,
+    ) -> None:
+        self._schema_table.load_schema(schema)
+        self._schema_group.setVisible(True)
+        plural = "s" if file_count != 1 else ""
+        self._log_info(
+            f"Schema loaded: {len(schema)} column(s), {file_count} file{plural}. "
+            f"All columns selected by default — uncheck any to exclude."
+        )
+
+    def _on_schema_error(self, msg: str) -> None:
+        self._log_error(f"Failed to load schema: {msg}")
+
+    def _on_schema_worker_finished(self) -> None:
+        self._load_schema_btn.setEnabled(True)
+        if self._schema_worker is not None:
+            self._schema_worker.deleteLater()
+            self._schema_worker = None
+
     def _on_collect(self) -> None:
         conn = self._conn_edit.text().strip()
         container = self._container_edit.text().strip()
@@ -179,13 +259,18 @@ class CollectorPanel(QWidget):
             self._log_error("Output prefix is required.")
             return
 
+        selected_columns = self._schema_table.get_selected_columns()
+
         self._collect_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._progress.setValue(0)
         self._progress.setVisible(True)
+        col_note = (
+            f" [{len(selected_columns)} columns]" if selected_columns is not None else ""
+        )
         self._log_info(
             f"Starting collection: {self._filter_combo.currentText()} "
-            f"{filter_values} â†’ {output_prefix}"
+            f"{filter_values} → {output_prefix}{col_note}"
         )
 
         self._worker = DataCollectorWorker(
@@ -199,6 +284,7 @@ class CollectorPanel(QWidget):
             max_workers=self._workers_spin.value(),
             ram_limit_mb=self._ram_spin.value(),
             autoscale=self._autoscale_check.isChecked(),
+            selected_columns=selected_columns,
         )
         self._worker.listing_complete.connect(self._on_listing_complete)
         self._worker.progress.connect(self._on_progress)
@@ -236,6 +322,7 @@ class CollectorPanel(QWidget):
             self._log_info(
                 f"Collection complete: {row_count} rows → [{out_container}] {out_blob}"
             )
+        self._resources_panel.clear_worker_throughput()
         self._request_worker_cleanup()
 
     def _on_cancelled(self) -> None:
@@ -243,10 +330,11 @@ class CollectorPanel(QWidget):
         self._cancel_btn.setEnabled(False)
         self._progress.setVisible(False)
         self._log_info("Collection cancelled.")
+        self._resources_panel.clear_worker_throughput()
         self._request_worker_cleanup()
 
     def _on_workers_scaled(self, new_count: int, old_count: int, direction: str, reason: str) -> None:
-        self._log_info(f"Workers {old_count}â†’{new_count} ({direction}): {reason}")
+        self._log_info(f"Workers {old_count}→{new_count} ({direction}): {reason}")
 
     def closeEvent(self, event) -> None:
         """Cancel any running worker and wait for it to exit before closing."""
