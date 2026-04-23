@@ -216,3 +216,39 @@ def test_worker_uses_separate_output_container():
 
     assert output_mock.upload_bytes.call_count == 1
     assert source_mock.upload_bytes.call_count == 0
+
+
+def test_selected_columns_stored_on_init():
+    """DataCollectorWorker stores selected_columns for use in _producer."""
+    import sys
+    from PyQt6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication(sys.argv)
+
+    from gui.workers import DataCollectorWorker
+    w = DataCollectorWorker(
+        connection_string="",
+        container="c",
+        source_prefix="",
+        output_prefix="out/",
+        filter_col="SenderUid",
+        filter_values=["uid1"],
+        selected_columns=["Id", "SenderUid", "TsCreate"],
+    )
+    assert w._selected_columns == ["Id", "SenderUid", "TsCreate"]
+
+
+def test_selected_columns_defaults_to_none():
+    import sys
+    from PyQt6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication(sys.argv)
+
+    from gui.workers import DataCollectorWorker
+    w = DataCollectorWorker(
+        connection_string="",
+        container="c",
+        source_prefix="",
+        output_prefix="out/",
+        filter_col="SenderUid",
+        filter_values=["uid1"],
+    )
+    assert w._selected_columns is None

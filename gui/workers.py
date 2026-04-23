@@ -942,6 +942,7 @@ class DataCollectorWorker(QThread):
         max_workers: int = 4,
         ram_limit_mb: int = 1024,
         autoscale: bool = True,
+        selected_columns: list[str] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -955,6 +956,7 @@ class DataCollectorWorker(QThread):
         self._max_workers = max_workers
         self._ram_limit_bytes = ram_limit_mb * 1024 * 1024
         self._autoscale = autoscale
+        self._selected_columns = selected_columns
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
         self._cancel_reason: str | None = None
@@ -1103,6 +1105,8 @@ class DataCollectorWorker(QThread):
                             filtered = filter_table_by_ids(
                                 table, self._filter_col, self._filter_values
                             )
+                            if self._selected_columns is not None:
+                                filtered = filtered.select(self._selected_columns)
                             if scaler is not None:
                                 scaler.record_download(len(raw), dl_s, True)
                             if filtered.num_rows > 0:
