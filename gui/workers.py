@@ -1248,6 +1248,7 @@ class DataCollectorWorker(QThread):
                                 done = completed[0]
                             # progress is safe to emit from threads (Qt queued delivery)
                             # file_error uses error_queue to guarantee delivery without an event loop
+                            _panel_deleted = False
                             try:
                                 self.progress.emit(done, total, blob_name, matched_rows)
                             except RuntimeError as exc:
@@ -1255,7 +1256,11 @@ class DataCollectorWorker(QThread):
                                 # before the background producer threads drained.
                                 if "has been deleted" not in str(exc):
                                     raise
-                                return
+                                _panel_deleted = True
+                        # Return OUTSIDE the finally block so no pending exception
+                        # is silently suppressed (SyntaxWarning: 'return' in 'finally').
+                        if _panel_deleted:
+                            return
                 finally:
                     client.close()
 
