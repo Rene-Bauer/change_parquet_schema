@@ -1147,6 +1147,10 @@ class DataCollectorWorker(QThread):
                                 tmp1_ref[0], chunk.schema,
                                 compression="zstd", compression_level=3,
                             )
+                        # If this chunk's schema differs from the writer schema
+                        # (e.g. mixed timestamp[ns] / timestamp[ms,UTC] sources),
+                        # cast with safe=False so sub-ms precision is truncated
+                        # rather than aborting the entire collection run.
                         write_chunk = chunk
                         if not chunk.schema.equals(writer_schema[0], check_metadata=False):
                             write_chunk = chunk.cast(writer_schema[0], safe=False)
