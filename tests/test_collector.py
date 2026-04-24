@@ -147,6 +147,11 @@ def test_make_output_blob_name_empty_ids_raises():
         make_output_blob_name("out/", "SenderUid", [])
 
 
+def test_make_output_blob_name_part_zero_raises():
+    with pytest.raises(ValueError, match="positive integer"):
+        make_output_blob_name("out/", "SenderUid", ["uid1"], part=0)
+
+
 def test_make_output_blob_name_with_part_number():
     name = make_output_blob_name("out/collected", "SenderUid", ["uid1"], part=1)
     assert name == "out/collected/SenderUid_uid1_part_001.parquet"

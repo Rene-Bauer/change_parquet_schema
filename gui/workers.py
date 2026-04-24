@@ -1112,11 +1112,13 @@ class DataCollectorWorker(QThread):
                         os.unlink(rw_tmp)
                     except Exception:
                         pass
-
-                try:
-                    os.unlink(current_tmp)
-                except Exception:
-                    pass
+                    # Always clean up the raw accumulation file regardless of
+                    # whether rewrite/upload succeeded; prevents orphaned temp
+                    # files when upload_stream raises (e.g. network timeout).
+                    try:
+                        os.unlink(current_tmp)
+                    except Exception:
+                        pass
 
                 # Prepare a fresh temp file for the next part
                 new_fd, new_tmp = tempfile.mkstemp(suffix=".parquet")
