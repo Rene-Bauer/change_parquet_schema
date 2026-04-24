@@ -960,6 +960,8 @@ class DataCollectorWorker(QThread):
         autoscale: bool = True,
         selected_columns: list[str] | None = None,
         max_output_bytes: int = 0,
+        start_part: int | None = None,   # when set, always use _part_NNN naming (archive mode)
+        _leaf: bool = False,             # internal: prevents subfolder detection recursion
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -975,11 +977,14 @@ class DataCollectorWorker(QThread):
         self._autoscale = autoscale
         self._selected_columns = selected_columns
         self._max_output_bytes = max_output_bytes
+        self._start_part = start_part
+        self._leaf = _leaf
         self._worker_count = max_workers
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # starts unpaused
         self._cancel_reason: str | None = None
+        self._archive_inner: "DataCollectorWorker | None" = None
 
     def cancel(self) -> None:
         self._cancel_reason = "user"
@@ -1070,7 +1075,9 @@ class DataCollectorWorker(QThread):
             # Per-part metadata accumulator (reset after each flush).
             # The global meta_acc tracks totals for finished.emit.
             part_acc_ref: list = [MetadataAccumulator()]
-            part_counter = [0]
+            # When start_part is provided (archive mode), start the counter one below
+            # so the first _flush_and_upload increment lands on start_part.
+            part_counter = [self._start_part - 1 if self._start_part is not None else 0]
 
             def _flush_and_upload() -> None:
                 """Close writer, rewrite metadata, upload via stream, start fresh tmp."""
@@ -1083,7 +1090,10 @@ class DataCollectorWorker(QThread):
                     return  # nothing to flush
 
                 part_counter[0] += 1
-                if self._max_output_bytes > 0:
+                # Use _part_NNN naming when:
+                #   (a) splitting is active (max_output_bytes > 0), OR
+                #   (b) called from archive mode (start_part set → global part numbering required)
+                if self._max_output_bytes > 0 or self._start_part is not None:
                     out_name = make_output_blob_name(
                         self._output_prefix,
                         self._filter_col,

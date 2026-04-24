@@ -463,3 +463,44 @@ def test_writer_no_splitting_when_max_output_bytes_zero():
     assert "_part_" not in upload_calls[0]
     assert "outputBlobs" in results
     assert results["outputBlobs"] == upload_calls
+
+
+# --- start_part / _leaf ---
+
+def test_start_part_stored_on_init():
+    worker = _make_worker(start_part=5)
+    assert worker._start_part == 5
+
+
+def test_start_part_defaults_to_none():
+    worker = _make_worker()
+    assert worker._start_part is None
+
+
+def test_leaf_flag_defaults_to_false():
+    worker = _make_worker()
+    assert worker._leaf is False
+
+
+def test_start_part_produces_part_numbered_output(monkeypatch):
+    """start_part=3 → first output file is _part_003 even with max_output_bytes=0."""
+    from unittest.mock import MagicMock, patch
+
+    raw = _make_parquet_bytes("uid1", "dev1", 3)
+    upload_calls = []
+
+    def fake_upload_stream(blob_name, file_path, timeout=None):
+        upload_calls.append(blob_name)
+
+    with patch("gui.workers.BlobStorageClient") as MockClient:
+        mock_instance = MockClient.return_value
+        mock_instance.list_blobs.return_value = ["blob1.parquet"]
+        mock_instance.download_bytes.return_value = raw
+        mock_instance.upload_stream.side_effect = fake_upload_stream
+        mock_instance.list_blob_prefixes.return_value = []  # no subfolders (forward-compat)
+
+        worker = _make_worker(start_part=3, max_output_bytes=0)
+        worker.run()
+
+    assert len(upload_calls) == 1
+    assert "_part_003" in upload_calls[0]
